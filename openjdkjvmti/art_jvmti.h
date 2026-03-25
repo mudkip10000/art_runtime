@@ -75,7 +75,7 @@ static constexpr jint kArtTiVersion = JVMTI_VERSION_1_2 | 0x40000000;
 static inline bool IsFullJvmtiAvailable() {
   art::Runtime* runtime = art::Runtime::Current();
   return runtime->GetInstrumentation()->IsForcedInterpretOnly() ||
-         runtime->IsJavaDebuggableAtInit();
+         runtime->IsJavaDebuggable();
 }
 
 // A structure that is a jvmtiEnv with additional information for the runtime.
