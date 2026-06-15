@@ -32,8 +32,12 @@
 #include "ti_method.h"
 
 #include <initializer_list>
+#include <string>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <variant>
+#include <vector>
 
 #include "android-base/logging.h"
 #include "android-base/macros.h"
@@ -47,6 +51,7 @@
 #include "deopt_manager.h"
 #include "dex/code_item_accessors-inl.h"
 #include "dex/code_item_accessors.h"
+#include "dex/dex_file-inl.h"
 #include "dex/dex_file_annotations.h"
 #include "dex/dex_file_types.h"
 #include "dex/dex_instruction.h"
@@ -201,6 +206,24 @@ jvmtiError MethodUtil::GetArgumentsSize([[maybe_unused]] jvmtiEnv* env,
   return ERR(NONE);
 }
 
+static inline jint MangleSlot(uint16_t dex_reg, uint16_t registers_size, uint16_t ins_size) {
+  uint16_t arg_base = registers_size - ins_size;
+  if (dex_reg >= arg_base) {
+    return dex_reg - arg_base;
+  }
+  return dex_reg + ins_size;
+}
+
+static inline jint DemangleSlot(jint jvm_slot, uint16_t registers_size, uint16_t ins_size) {
+  if (jvm_slot < 0) {
+    return jvm_slot;
+  }
+  if (jvm_slot < ins_size) {
+    return jvm_slot + (registers_size - ins_size);
+  }
+  return jvm_slot - ins_size;
+}
+
 jvmtiError MethodUtil::GetLocalVariableTable(jvmtiEnv* env,
                                              jmethodID method,
                                              jint* entry_count_ptr,
@@ -225,15 +248,106 @@ jvmtiError MethodUtil::GetLocalVariableTable(jvmtiEnv* env,
     return ERR(ABSENT_INFORMATION);
   }
 
-  // TODO HasCodeItem == false means that the method is abstract (or native, but we check that
-  // earlier). We should check what is returned by the RI in this situation since it's not clear
-  // what the appropriate return value is from the spec.
   art::CodeItemDebugInfoAccessor accessor(art_method->DexInstructionDebugInfo());
   if (!accessor.HasCodeItem()) {
     return ERR(ABSENT_INFORMATION);
   }
 
+  const bool is_static = art_method->IsStatic();
+  const uint16_t registers_size = accessor.RegistersSize();
+  const uint16_t ins_size = accessor.InsSize();
+  const auto insns_size = static_cast<jint>(accessor.InsnsSizeInCodeUnits());
+
+  struct ArgSlot {
+    uint16_t reg;
+    const char* descriptor;
+    bool is_this;
+    uint32_t param_index;
+  };
+  std::vector<ArgSlot> arg_slots;
+  std::unordered_set<uint16_t> arg_regs;
+  uint16_t arg_reg = registers_size - ins_size;
+  if (!is_static) {
+    arg_slots.push_back({arg_reg, art_method->GetDeclaringClassDescriptor(), true, 0});
+    arg_regs.insert(arg_reg);
+    arg_reg++;
+  }
+  {
+    art::DexFileParameterIterator it(
+        *dex_file,
+        dex_file->GetMethodPrototype(dex_file->GetMethodId(art_method->GetDexMethodIndex())));
+    for (uint32_t param_index = 0; it.HasNext(); it.Next(), ++param_index) {
+      const char* descriptor = it.GetDescriptor();
+      arg_slots.push_back({arg_reg, descriptor, false, param_index});
+      arg_regs.insert(arg_reg);
+      if (descriptor[0] == 'J' || descriptor[0] == 'D') {
+        if (arg_reg + 1 < registers_size) {
+          arg_regs.insert(static_cast<uint16_t>(arg_reg + 1));
+        }
+        arg_reg += 2;
+      } else {
+        arg_reg += 1;
+      }
+    }
+  }
+
+  struct RecoveredName {
+    std::string name;
+    bool has_name = false;
+    std::string generic;
+    bool has_generic = false;
+  };
+  struct BodyLocal {
+    std::string name;
+    bool has_name = false;
+    std::string descriptor;
+    bool has_descriptor = false;
+    std::string generic;
+    bool has_generic = false;
+    uint32_t start = 0;
+    uint32_t end = 0;
+    uint16_t reg = 0;
+  };
+  std::unordered_map<uint16_t, RecoveredName> recovered;
+  std::vector<BodyLocal> body_locals;
+
+  auto visitor = [&](const art::DexFile::LocalInfo& entry) {
+    if (arg_regs.find(entry.reg_) != arg_regs.end()) {
+      if (entry.start_address_ == 0) {
+        RecoveredName& rec = recovered[entry.reg_];
+        if (!rec.has_name && entry.name_ != nullptr) {
+          rec.name = entry.name_;
+          rec.has_name = true;
+        }
+        if (!rec.has_generic && entry.signature_ != nullptr) {
+          rec.generic = entry.signature_;
+          rec.has_generic = true;
+        }
+      }
+      return;
+    }
+    BodyLocal b;
+    b.reg = entry.reg_;
+    b.start = entry.start_address_;
+    b.end = entry.end_address_;
+    if (entry.name_ != nullptr) {
+      b.name = entry.name_;
+      b.has_name = true;
+    }
+    if (entry.descriptor_ != nullptr) {
+      b.descriptor = entry.descriptor_;
+      b.has_descriptor = true;
+    }
+    if (entry.signature_ != nullptr) {
+      b.generic = entry.signature_;
+      b.has_generic = true;
+    }
+    body_locals.push_back(std::move(b));
+  };
+  accessor.DecodeDebugLocalInfo(is_static, art_method->GetDexMethodIndex(), std::move(visitor));
+
   std::vector<jvmtiLocalVariableEntry> variables;
+  variables.reserve(arg_slots.size() + body_locals.size());
   jvmtiError err = OK;
 
   auto release = [&](jint* out_entry_count_ptr, jvmtiLocalVariableEntry** out_table_ptr) {
@@ -253,38 +367,62 @@ jvmtiError MethodUtil::GetLocalVariableTable(jvmtiEnv* env,
     return OK;
   };
 
-  // To avoid defining visitor in the same line as the `if`. We define the lambda and use std::move.
-  auto visitor = [&](const art::DexFile::LocalInfo& entry) {
+  auto push_entry = [&](const char* name, const char* signature, const char* generic,
+                        jlocation start_location, jint length, jint slot) {
     if (err != OK) {
       return;
     }
-    JvmtiUniquePtr<char[]> name_str = CopyString(env, entry.name_, &err);
+    JvmtiUniquePtr<char[]> name_str = CopyString(env, name, &err);
     if (err != OK) {
       return;
     }
-    JvmtiUniquePtr<char[]> sig_str = CopyString(env, entry.descriptor_, &err);
+    JvmtiUniquePtr<char[]> sig_str = CopyString(env, signature, &err);
     if (err != OK) {
       return;
     }
-    JvmtiUniquePtr<char[]> generic_sig_str = CopyString(env, entry.signature_, &err);
+    JvmtiUniquePtr<char[]> generic_sig_str = CopyString(env, generic, &err);
     if (err != OK) {
       return;
     }
     variables.push_back({
-      .start_location = static_cast<jlocation>(entry.start_address_),
-      .length = static_cast<jint>(entry.end_address_ - entry.start_address_),
+      .start_location = start_location,
+      .length = length,
       .name = name_str.release(),
       .signature = sig_str.release(),
       .generic_signature = generic_sig_str.release(),
-      .slot = entry.reg_,
+      .slot = slot,
     });
   };
 
-  if (!accessor.DecodeDebugLocalInfo(
-          art_method->IsStatic(), art_method->GetDexMethodIndex(), std::move(visitor))) {
-    // Something went wrong with decoding the debug information. It might as well not be there.
-    return ERR(ABSENT_INFORMATION);
+  for (const ArgSlot& slot : arg_slots) {
+    auto rec_it = recovered.find(slot.reg);
+    std::string synthesized;
+    const char* name;
+    const char* generic = nullptr;
+    if (rec_it != recovered.end() && rec_it->second.has_name && !rec_it->second.name.empty()) {
+      name = rec_it->second.name.c_str();
+      if (rec_it->second.has_generic) {
+        generic = rec_it->second.generic.c_str();
+      }
+    } else if (slot.is_this) {
+      name = "this";
+    } else {
+      synthesized = "p" + std::to_string(slot.param_index);
+      name = synthesized.c_str();
+    }
+    push_entry(name, slot.descriptor, generic, 0, insns_size,
+               MangleSlot(slot.reg, registers_size, ins_size));
   }
+
+  for (const BodyLocal& b : body_locals) {
+    push_entry(b.has_name ? b.name.c_str() : nullptr,
+               b.has_descriptor ? b.descriptor.c_str() : nullptr,
+               b.has_generic ? b.generic.c_str() : nullptr,
+               static_cast<jlocation>(b.start),
+               static_cast<jint>(b.end - b.start),
+               MangleSlot(b.reg, registers_size, ins_size));
+  }
+
   return release(entry_count_ptr, table_ptr);
 }
 
@@ -588,6 +726,9 @@ class CommonLocalVariableClosure : public art::Closure {
         result_ = ERR(INVALID_SLOT);
         return;
       }
+      slot_ = DemangleSlot(slot_,
+                           method->DexInstructionData().RegistersSize(),
+                           method->DexInstructionData().InsSize());
       needs_instrument = !visitor.IsShadowFrame();
       uint32_t pc = visitor.GetDexPc(/*abort_on_failure=*/false);
       if (pc == art::dex::kDexNoIndex) {
