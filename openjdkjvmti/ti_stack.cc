@@ -69,7 +69,9 @@
 #include "jvmti.h"
 #include "mirror/class.h"
 #include "mirror/dex_cache.h"
+#include "mirror/object-inl.h"
 #include "nativehelper/scoped_local_ref.h"
+#include "reflection-inl.h"
 #include "scoped_thread_state_change-inl.h"
 #include "scoped_thread_state_change.h"
 #include "stack.h"
@@ -1284,73 +1286,153 @@ class SetupMethodExitEvents {
   bool failed_ = false;
 };
 
-template <typename T>
-void AddDelayedMethodExitEvent(EventHandler* handler, art::ShadowFrame* frame, T value)
-    REQUIRES_SHARED(art::Locks::mutator_lock_)
-    REQUIRES(art::Locks::user_code_suspension_lock_, art::Locks::thread_list_lock_);
-
-template <typename T>
-void AddDelayedMethodExitEvent(EventHandler* handler, art::ShadowFrame* frame, T value) {
-  art::JValue val = art::JValue::FromPrimitive(value);
-  jvalue jval{ .j = val.GetJ() };
-  handler->AddDelayedNonStandardExitEvent(frame, false, jval);
-}
-
-template <>
-void AddDelayedMethodExitEvent<std::nullptr_t>(EventHandler* handler,
-                                               art::ShadowFrame* frame,
-                                               [[maybe_unused]] std::nullptr_t null_val) {
-  jvalue jval;
-  memset(&jval, 0, sizeof(jval));
-  handler->AddDelayedNonStandardExitEvent(frame, false, jval);
-}
-
-template <>
-void AddDelayedMethodExitEvent<jobject>(EventHandler* handler,
-                                        art::ShadowFrame* frame,
-                                        jobject obj) {
-  jvalue jval{ .l = art::Thread::Current()->GetJniEnv()->NewGlobalRef(obj) };
-  handler->AddDelayedNonStandardExitEvent(frame, true, jval);
-}
-
-template <typename T>
-bool ValidReturnType(art::Thread* self, art::ObjPtr<art::mirror::Class> return_type, T value)
-    REQUIRES_SHARED(art::Locks::mutator_lock_)
-        REQUIRES(art::Locks::user_code_suspension_lock_, art::Locks::thread_list_lock_);
-
-#define SIMPLE_VALID_RETURN_TYPE(type, ...)                                                       \
-  template <>                                                                                     \
-  bool ValidReturnType<type>([[maybe_unused]] art::Thread * self,                                 \
-                             art::ObjPtr<art::mirror::Class> return_type,                         \
-                             [[maybe_unused]] type value) {                                       \
-    static constexpr std::initializer_list<art::Primitive::Type> types{__VA_ARGS__};              \
-    return std::find(types.begin(), types.end(), return_type->GetPrimitiveType()) != types.end(); \
-  }
-
-SIMPLE_VALID_RETURN_TYPE(jlong, art::Primitive::kPrimLong);
-SIMPLE_VALID_RETURN_TYPE(jfloat, art::Primitive::kPrimFloat);
-SIMPLE_VALID_RETURN_TYPE(jdouble, art::Primitive::kPrimDouble);
-SIMPLE_VALID_RETURN_TYPE(nullptr_t, art::Primitive::kPrimVoid);
-SIMPLE_VALID_RETURN_TYPE(jint,
-                         art::Primitive::kPrimInt,
-                         art::Primitive::kPrimChar,
-                         art::Primitive::kPrimBoolean,
-                         art::Primitive::kPrimShort,
-                         art::Primitive::kPrimByte);
-#undef SIMPLE_VALID_RETURN_TYPE
-
-template <>
-bool ValidReturnType<jobject>(art::Thread* self,
-                              art::ObjPtr<art::mirror::Class> return_type,
-                              jobject return_value) {
-  if (return_type->IsPrimitive()) {
+bool UnboxForcedReturnNoThrow(art::ObjPtr<art::mirror::Object> o,
+                              art::Primitive::Type dst_type,
+                              art::JValue* out)
+    REQUIRES_SHARED(art::Locks::mutator_lock_) {
+  if (o == nullptr) {
     return false;
   }
-  if (return_value == nullptr) {
-    // Null can be used for anything.
+  art::ObjPtr<art::mirror::Class> klass = o->GetClass();
+  art::JValue boxed;
+  art::Primitive::Type src_type;
+  if (klass == art::WellKnownClasses::java_lang_Boolean) {
+    src_type = art::Primitive::kPrimBoolean;
+    boxed.SetZ(art::WellKnownClasses::java_lang_Boolean_value->GetBoolean(o));
+  } else if (klass == art::WellKnownClasses::java_lang_Byte) {
+    src_type = art::Primitive::kPrimByte;
+    boxed.SetB(art::WellKnownClasses::java_lang_Byte_value->GetByte(o));
+  } else if (klass == art::WellKnownClasses::java_lang_Character) {
+    src_type = art::Primitive::kPrimChar;
+    boxed.SetC(art::WellKnownClasses::java_lang_Character_value->GetChar(o));
+  } else if (klass == art::WellKnownClasses::java_lang_Short) {
+    src_type = art::Primitive::kPrimShort;
+    boxed.SetS(art::WellKnownClasses::java_lang_Short_value->GetShort(o));
+  } else if (klass == art::WellKnownClasses::java_lang_Integer) {
+    src_type = art::Primitive::kPrimInt;
+    boxed.SetI(art::WellKnownClasses::java_lang_Integer_value->GetInt(o));
+  } else if (klass == art::WellKnownClasses::java_lang_Long) {
+    src_type = art::Primitive::kPrimLong;
+    boxed.SetJ(art::WellKnownClasses::java_lang_Long_value->GetLong(o));
+  } else if (klass == art::WellKnownClasses::java_lang_Float) {
+    src_type = art::Primitive::kPrimFloat;
+    boxed.SetF(art::WellKnownClasses::java_lang_Float_value->GetFloat(o));
+  } else if (klass == art::WellKnownClasses::java_lang_Double) {
+    src_type = art::Primitive::kPrimDouble;
+    boxed.SetD(art::WellKnownClasses::java_lang_Double_value->GetDouble(o));
+  } else {
+    return false;
+  }
+  return art::ConvertPrimitiveValueNoThrow(src_type, dst_type, boxed, out);
+}
+
+bool CoercePrimitiveForcedReturn(art::ObjPtr<art::mirror::Class> rt,
+                                 art::Primitive::Type src_type,
+                                 const art::JValue& src,
+                                 jvalue* out_val,
+                                 bool* out_is_object)
+    REQUIRES_SHARED(art::Locks::mutator_lock_) {
+  if (!rt->IsPrimitive()) {
+    return false;
+  }
+  art::Primitive::Type dst_type = rt->GetPrimitiveType();
+  if (dst_type == art::Primitive::kPrimVoid) {
+    return false;
+  }
+  art::JValue converted;
+  if (src_type == art::Primitive::kPrimInt &&
+      (dst_type == art::Primitive::kPrimBoolean ||
+       dst_type == art::Primitive::kPrimByte ||
+       dst_type == art::Primitive::kPrimChar ||
+       dst_type == art::Primitive::kPrimShort)) {
+    // JDWP collapses boolean/byte/char/short return values into an int on the wire
+    // (ForceEarlyReturnInt), so the source arrives here as kPrimInt. ConvertPrimitiveValueNoThrow
+    // only performs JLS widening and would reject int->{boolean,byte,char,short}, so accept these
+    // sub-int destinations directly and keep the low bits (matching the previous ValidReturnType).
+    converted.SetJ(src.GetJ());
+  } else if (!art::ConvertPrimitiveValueNoThrow(src_type, dst_type, src, &converted)) {
+    return false;
+  }
+  out_val->j = converted.GetJ();
+  *out_is_object = false;
+  return true;
+}
+
+bool CoerceForcedReturnValue([[maybe_unused]] art::Thread* self,
+                             art::ObjPtr<art::mirror::Class> rt,
+                             jint value, jvalue* out_val, bool* out_is_object)
+    REQUIRES_SHARED(art::Locks::mutator_lock_) {
+  art::JValue src;
+  src.SetI(value);
+  return CoercePrimitiveForcedReturn(rt, art::Primitive::kPrimInt, src, out_val, out_is_object);
+}
+
+bool CoerceForcedReturnValue([[maybe_unused]] art::Thread* self,
+                             art::ObjPtr<art::mirror::Class> rt,
+                             jlong value, jvalue* out_val, bool* out_is_object)
+    REQUIRES_SHARED(art::Locks::mutator_lock_) {
+  art::JValue src;
+  src.SetJ(value);
+  return CoercePrimitiveForcedReturn(rt, art::Primitive::kPrimLong, src, out_val, out_is_object);
+}
+
+bool CoerceForcedReturnValue([[maybe_unused]] art::Thread* self,
+                             art::ObjPtr<art::mirror::Class> rt,
+                             jfloat value, jvalue* out_val, bool* out_is_object)
+    REQUIRES_SHARED(art::Locks::mutator_lock_) {
+  art::JValue src;
+  src.SetF(value);
+  return CoercePrimitiveForcedReturn(rt, art::Primitive::kPrimFloat, src, out_val, out_is_object);
+}
+
+bool CoerceForcedReturnValue([[maybe_unused]] art::Thread* self,
+                             art::ObjPtr<art::mirror::Class> rt,
+                             jdouble value, jvalue* out_val, bool* out_is_object)
+    REQUIRES_SHARED(art::Locks::mutator_lock_) {
+  art::JValue src;
+  src.SetD(value);
+  return CoercePrimitiveForcedReturn(rt, art::Primitive::kPrimDouble, src, out_val, out_is_object);
+}
+
+bool CoerceForcedReturnValue(art::Thread* self,
+                             art::ObjPtr<art::mirror::Class> rt,
+                             jobject value, jvalue* out_val, bool* out_is_object)
+    REQUIRES_SHARED(art::Locks::mutator_lock_) {
+  art::ObjPtr<art::mirror::Object> obj = self->DecodeJObject(value);
+  if (rt->IsPrimitive()) {
+    art::Primitive::Type dst_type = rt->GetPrimitiveType();
+    if (dst_type == art::Primitive::kPrimVoid) {
+      return false;
+    }
+    art::JValue converted;
+    if (!UnboxForcedReturnNoThrow(obj, dst_type, &converted)) {
+      return false;
+    }
+    out_val->j = converted.GetJ();
+    *out_is_object = false;
     return true;
   }
-  return return_type->IsAssignableFrom(self->DecodeJObject(return_value)->GetClass());
+  if (obj != nullptr && !rt->IsAssignableFrom(obj->GetClass())) {
+    return false;
+  }
+  out_val->l = value;
+  *out_is_object = true;
+  return true;
+}
+
+bool CoerceForcedReturnValue([[maybe_unused]] art::Thread* self,
+                             art::ObjPtr<art::mirror::Class> rt,
+                             [[maybe_unused]] std::nullptr_t value,
+                             jvalue* out_val, bool* out_is_object)
+    REQUIRES_SHARED(art::Locks::mutator_lock_) {
+  if (rt->IsPrimitive()) {
+    memset(out_val, 0, sizeof(*out_val));
+    *out_is_object = false;
+    return rt->GetPrimitiveType() == art::Primitive::kPrimVoid;
+  }
+  out_val->l = nullptr;
+  *out_is_object = true;
+  return true;
 }
 
 }  // namespace
@@ -1398,12 +1480,19 @@ StackUtil::ForceEarlyReturn(jvmtiEnv* env, EventHandler* event_handler, jthread 
     smee.NotifyFailure();
     art::Locks::thread_list_lock_->ExclusiveUnlock(self);
     return frames.result_;
-  } else if (!ValidReturnType<T>(
-                 self, frames.final_frame_->GetMethod()->ResolveReturnType(), value)) {
+  }
+  jvalue coerced_val;
+  bool coerced_is_object = false;
+  if (!CoerceForcedReturnValue(self,
+                               frames.final_frame_->GetMethod()->ResolveReturnType(),
+                               value,
+                               &coerced_val,
+                               &coerced_is_object)) {
     smee.NotifyFailure();
     art::Locks::thread_list_lock_->ExclusiveUnlock(self);
     return ERR(TYPE_MISMATCH);
-  } else if (frames.final_frame_->GetForcePopFrame()) {
+  }
+  if (frames.final_frame_->GetForcePopFrame()) {
     // TODO We should really support this.
     smee.NotifyFailure();
     std::string thread_name;
@@ -1414,7 +1503,7 @@ StackUtil::ForceEarlyReturn(jvmtiEnv* env, EventHandler* event_handler, jthread 
   }
   // Tell the shadow-frame to return immediately and skip all exit events.
   frames.final_frame_->SetForcePopFrame(true);
-  AddDelayedMethodExitEvent<T>(event_handler, frames.final_frame_, value);
+  event_handler->AddDelayedNonStandardExitEvent(frames.final_frame_, coerced_is_object, coerced_val);
   if (frames.created_final_frame_ || frames.created_penultimate_frame_) {
     art::FunctionClosure fc([](art::Thread* self) REQUIRES_SHARED(art::Locks::mutator_lock_){
       DeoptManager::Get()->DeoptimizeThread(self);
