@@ -694,11 +694,6 @@ jvmtiError ClassUtil::GetImplementedInterfaces(jvmtiEnv* env,
   return ERR(NONE);
 }
 
-// TEMP: verbose RuleIndex drop logging (remove after debugging)
-// static void RuleIndexLogDrop(const char* kind, const std::string& detail) {
-//   LOG(WARNING) << "DAST RuleIndex DROP " << kind << ": " << detail;
-// }
-
 jvmtiError ClassUtil::RuleIndexShouldReport([[maybe_unused]] jvmtiEnv* env,
                                             jclass jklass,
                                             jboolean* should_report_ptr) {
@@ -712,12 +707,6 @@ jvmtiError ClassUtil::RuleIndexShouldReport([[maybe_unused]] jvmtiEnv* env,
   art::ScopedObjectAccess soa(art::Thread::Current());
   art::ObjPtr<art::mirror::Class> klass = soa.Decode<art::mirror::Class>(jklass);
   bool forward = (klass == nullptr || RuleIndex::MightMatch(klass));
-  // if (!forward) {
-  //   art::ObjPtr<art::mirror::Class> k = soa.Decode<art::mirror::Class>(jklass);
-  //   if (k != nullptr) {
-  //     RuleIndexLogDrop("class-load", k->PrettyDescriptor());
-  //   }
-  // }
   *should_report_ptr = forward ? JNI_TRUE : JNI_FALSE;
   return ERR(NONE);
 }
@@ -725,28 +714,7 @@ jvmtiError ClassUtil::RuleIndexShouldReport([[maybe_unused]] jvmtiEnv* env,
 namespace {
 
 std::mutex g_regex_mutex;
-jmethodID g_object_tostring = nullptr;
-bool g_tostring_init_failed = false;
 std::unordered_map<std::string, std::unique_ptr<std::regex>> g_regex_cache;
-
-bool EnsureToStringMethod(JNIEnv* env) {
-  if (g_object_tostring != nullptr) {
-    return true;
-  }
-  if (g_tostring_init_failed) {
-    return false;
-  }
-  jclass object_cls = env->FindClass("java/lang/Object");
-  if (object_cls != nullptr) {
-    g_object_tostring = env->GetMethodID(object_cls, "toString", "()Ljava/lang/String;");
-    env->DeleteLocalRef(object_cls);
-  }
-  if (env->ExceptionCheck()) {
-    env->ExceptionClear();
-  }
-  g_tostring_init_failed = (g_object_tostring == nullptr);
-  return !g_tostring_init_failed;
-}
 
 // std::regex (ECMAScript) cannot parse Java-style inline flags like "(?i)" that
 // Pattern.toString() emits. Translate leading flag group(s) into std::regex flags
@@ -801,47 +769,33 @@ const std::regex* GetCompiledRegex(const std::string& pattern) {
   return result;
 }
 
-bool EvalPendingRegex(JNIEnv* env, const std::vector<std::pair<std::string, jobject>>& pending) {
-  for (const std::pair<std::string, jobject>& pr : pending) {
+// Pure C++ match on already-extracted UTF-8 haystacks (no JNI / no Java toString).
+// Returns true (= forward event) if any pattern matches or is invalid (fail-open).
+bool EvalPendingRegex(const std::vector<std::pair<std::string, std::string>>& pending) {
+  for (const std::pair<std::string, std::string>& pr : pending) {
     const std::regex* pattern = GetCompiledRegex(pr.first);
     if (pattern == nullptr) {
       return true;
     }
-    if (pr.second == nullptr || !EnsureToStringMethod(env)) {
-      return true;
-    }
-    jobject value = env->CallObjectMethod(pr.second, g_object_tostring);
-    if (env->ExceptionCheck()) {
-      env->ExceptionClear();
-      return true;
-    }
-    if (value == nullptr) {
-      return true;
-    }
-    jstring jstr = reinterpret_cast<jstring>(value);
-    const char* chars = env->GetStringUTFChars(jstr, nullptr);
-    if (chars == nullptr) {
-      if (env->ExceptionCheck()) {
-        env->ExceptionClear();
-      }
-      env->DeleteLocalRef(value);
-      return true;
-    }
-    bool matched = false;
-    bool error = false;
     try {
-      matched = std::regex_search(chars, *pattern);
+      if (std::regex_search(pr.second, *pattern)) {
+        return true;
+      }
     } catch (const std::regex_error&) {
-      error = true;
-    }
-    env->ReleaseStringUTFChars(jstr, chars);
-    env->DeleteLocalRef(value);
-    if (error || matched) {
       return true;
     }
   }
   return false;
 }
+
+// Clears thread-local reentrancy flag on all exit paths (including early return).
+struct RuleIndexArgGate {
+  bool* flag;
+  explicit RuleIndexArgGate(bool* f) : flag(f) { *flag = true; }
+  ~RuleIndexArgGate() { *flag = false; }
+  RuleIndexArgGate(const RuleIndexArgGate&) = delete;
+  RuleIndexArgGate& operator=(const RuleIndexArgGate&) = delete;
+};
 
 }
 
@@ -859,22 +813,27 @@ jvmtiError ClassUtil::RuleIndexArgShouldReport([[maybe_unused]] jvmtiEnv* env,
     return ERR(NONE);
   }
 
+  // Non-reentrant: nested BP/exit while we filter must not enter JDWP again
+  // (debugMonitor deadlock). Suppress the nested event (not "forward").
   static thread_local bool in_gate = false;
   if (in_gate) {
+    *should_report_ptr = JNI_FALSE;
+    return ERR(NONE);
+  }
+  RuleIndexArgGate gate(&in_gate);
+
+  art::Thread* self = art::Thread::Current();
+  if (self == nullptr) {
     *should_report_ptr = JNI_TRUE;
     return ERR(NONE);
   }
-  in_gate = true;
 
-  art::Thread* self = art::Thread::Current();
   bool forward = true;
-  // std::string method_pretty;
-  std::vector<std::pair<std::string, jobject>> pending;
+  std::vector<std::pair<std::string, std::string>> pending;
   {
     art::ScopedObjectAccess soa(self);
     art::ArtMethod* art_method = art::jni::DecodeArtMethod(method);
     if (art_method != nullptr) {
-      // method_pretty = art_method->PrettyMethod(true);
       bool return_is_ref = false;
       art::ObjPtr<art::mirror::Object> return_obj;
       if (is_method_exit != JNI_FALSE) {
@@ -891,20 +850,10 @@ jvmtiError ClassUtil::RuleIndexArgShouldReport([[maybe_unused]] jvmtiEnv* env,
     }
   }
 
-  JNIEnv* jni = self->GetJniEnv();
   if (!forward && !pending.empty()) {
-    forward = EvalPendingRegex(jni, pending);
-  }
-  for (const std::pair<std::string, jobject>& pr : pending) {
-    if (pr.second != nullptr) {
-      jni->DeleteLocalRef(pr.second);
-    }
+    forward = EvalPendingRegex(pending);
   }
   RuleIndex::RecordArgDecision(forward);
-  // if (!forward && !method_pretty.empty()) {
-  //   RuleIndexLogDrop(is_method_exit != JNI_FALSE ? "method-exit" : "breakpoint", method_pretty);
-  // }
-  in_gate = false;
   *should_report_ptr = forward ? JNI_TRUE : JNI_FALSE;
   return ERR(NONE);
 }

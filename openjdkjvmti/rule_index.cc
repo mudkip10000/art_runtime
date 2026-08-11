@@ -672,7 +672,7 @@ bool RuleIndex::ArgsMightMatch(art::ArtMethod* method,
                                art::ObjPtr<art::mirror::Object> return_value,
                                bool return_is_ref,
                                bool is_method_exit,
-                               std::vector<std::pair<std::string, jobject>>* pending_regex) {
+                               std::vector<std::pair<std::string, std::string>>* pending_regex) {
   const IndexData* idx = g_index;
   if (idx == nullptr || !idx->arg_active || method == nullptr) {
     return true;
@@ -741,8 +741,17 @@ bool RuleIndex::ArgsMightMatch(art::ArtMethod* method,
       continue;
     }
     if (p.is_regex) {
-      jobject ref = self->GetJniEnv()->AddLocalReference<jobject>(value);
-      pending_regex->emplace_back(p.literals.empty() ? std::string() : p.literals[0], ref);
+      // Safe path only: mirror String → UTF-8. Calling Java toString() from a
+      // breakpoint/method-exit filter re-enters JVMTI/JDWP and deadlocks.
+      if (!value->GetClass()->IsStringClass()) {
+        return true;
+      }
+      if (pending_regex != nullptr) {
+        pending_regex->emplace_back(p.literals.empty() ? std::string() : p.literals[0],
+                                    value->AsString()->ToModifiedUtf8());
+      } else {
+        return true;
+      }
       continue;
     }
     if (!value->GetClass()->IsStringClass()) {

@@ -7,8 +7,6 @@
 #include <utility>
 #include <vector>
 
-#include <jni.h>
-
 #include "base/locks.h"
 #include "mirror/class.h"
 #include "mirror/object.h"
@@ -31,11 +29,13 @@ class RuleIndex {
   static bool MightMatch(art::ObjPtr<art::mirror::Class> klass)
       REQUIRES_SHARED(art::Locks::mutator_lock_);
 
+  // pending_regex: (pattern, haystack) for String args only. Non-String regex
+  // predicates fail-open (return true) — never JNI toString from a BP callback.
   static bool ArgsMightMatch(art::ArtMethod* method,
                              art::ObjPtr<art::mirror::Object> return_value,
                              bool return_is_ref,
                              bool is_method_exit,
-                             std::vector<std::pair<std::string, jobject>>* pending_regex)
+                             std::vector<std::pair<std::string, std::string>>* pending_regex)
       REQUIRES_SHARED(art::Locks::mutator_lock_);
 
   static void RecordArgDecision(bool forward);
