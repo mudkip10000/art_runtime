@@ -1518,6 +1518,13 @@ void PerformNonStandardReturn(Thread* self,
     DoMonitorCheckOnExit(self, &frame);
   }
   result = JValue();
+  // SCANNER: Fetch the forced return value (if any) here instead of relying on the method-exit
+  // listener. Method-exit events are skipped for frames deoptimized from a method-exit hook (and
+  // for frames whose code doesn't support exit events), which used to lose the forced value: the
+  // method returned null/0 and the pending entry leaked onto a later frame at the same address.
+  if (instrumentation != nullptr) {
+    instrumentation->NonStandardExitPoppedEvent(self, frame, result);
+  }
   if (UNLIKELY(NeedsMethodExitEvent(instrumentation))) {
     SendMethodExitEvents(self, instrumentation, frame, frame.GetMethod(), result);
   }

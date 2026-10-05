@@ -490,6 +490,17 @@ class DeoptimizeStackVisitor final : public StackVisitor {
       // Check if a shadow frame already exists for debugger's set-local-value purpose.
       const size_t frame_id = GetFrameId();
       ShadowFrame* new_frame = GetThread()->FindDebuggerShadowFrame(frame_id);
+      if (new_frame != nullptr && new_frame->GetMethod() != method) {
+        // SCANNER: A debugger shadow frame left at this height by a different method (never
+        // deoptimized). Using it would execute `method` with the other method's registers and
+        // pending forced pop. Drop it and deoptimize normally.
+        LOG(WARNING) << "Discarding stale debugger shadow frame for "
+                     << ArtMethod::PrettyMethod(new_frame->GetMethod()) << " while deoptimizing "
+                     << ArtMethod::PrettyMethod(method);
+        GetThread()->RemoveDebuggerShadowFrameMapping(frame_id);
+        ShadowFrame::DeleteDeoptimizedFrame(new_frame);
+        new_frame = nullptr;
+      }
       const bool* updated_vregs;
       CodeItemDataAccessor accessor(method->DexInstructionData());
       const size_t num_regs = accessor.RegistersSize();

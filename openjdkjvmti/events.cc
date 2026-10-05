@@ -604,7 +604,7 @@ class JvmtiMethodTraceListener final : public art::instrumentation::Instrumentat
     jobject new_val = is_object ? self->GetJniEnv()->NewGlobalRef(val.l) : nullptr;
     {
       art::MutexLock mu(self, non_standard_exits_lock_);
-      NonStandardExitEventInfo saved{ nullptr, { .j = 0 } };
+      NonStandardExitEventInfo saved{ nullptr, { .j = 0 }, frame->GetMethod() };
       if (is_object) {
         saved.return_val_obj_ = new_val;
         saved.return_val_.l = saved.return_val_obj_;
@@ -618,6 +618,12 @@ class JvmtiMethodTraceListener final : public art::instrumentation::Instrumentat
       non_standard_exits_.insert_or_assign(frame, saved);
     }
     self->GetJniEnv()->DeleteGlobalRef(to_cleanup);
+  }
+
+  bool HasDelayedNonStandardExitEvent(const art::ShadowFrame* frame)
+      REQUIRES_SHARED(art::Locks::mutator_lock_) {
+    art::MutexLock mu(art::Thread::Current(), non_standard_exits_lock_);
+    return non_standard_exits_.find(frame) != non_standard_exits_.end();
   }
 
   // Call-back for when a method is entered.
@@ -646,17 +652,12 @@ class JvmtiMethodTraceListener final : public art::instrumentation::Instrumentat
     if (frame.has_value() && UNLIKELY(event_handler_->IsEventEnabledAnywhere(
                                  ArtJvmtiEvent::kForceEarlyReturnUpdateReturnValue))) {
       DCHECK(!frame->get().GetSkipMethodExitEvents());
-      bool has_return = false;
-      jobject ret_val = nullptr;
-      {
-        art::MutexLock mu(self, non_standard_exits_lock_);
-        const art::ShadowFrame* sframe = &frame.value().get();
-        const auto it = non_standard_exits_.find(sframe);
-        if (it != non_standard_exits_.end()) {
-          ret_val = it->second.return_val_obj_;
-          non_standard_exits_.erase(it);
-          has_return = true;
-        }
+      NonStandardExitEventInfo info;
+      jobject stale_obj = nullptr;
+      bool has_return = TakeNonStandardExit(self, &frame.value().get(), &info, &stale_obj);
+      jobject ret_val = has_return ? info.return_val_obj_ : nullptr;
+      if (stale_obj != nullptr) {
+        self->GetJniEnv()->DeleteGlobalRef(stale_obj);
       }
       if (has_return) {
         return_value.Assign(self->DecodeJObject(ret_val));
@@ -696,18 +697,14 @@ class JvmtiMethodTraceListener final : public art::instrumentation::Instrumentat
         UNLIKELY(event_handler_->IsEventEnabledAnywhere(
             ArtJvmtiEvent::kForceEarlyReturnUpdateReturnValue))) {
       DCHECK(!frame->get().GetSkipMethodExitEvents());
-      bool has_return = false;
-      {
-        art::MutexLock mu(self, non_standard_exits_lock_);
-        const art::ShadowFrame* sframe = &frame.value().get();
-        const auto it = non_standard_exits_.find(sframe);
-        if (it != non_standard_exits_.end()) {
-          return_value.SetJ(it->second.return_val_.j);
-          non_standard_exits_.erase(it);
-          has_return = true;
-        }
+      NonStandardExitEventInfo info;
+      jobject stale_obj = nullptr;
+      bool has_return = TakeNonStandardExit(self, &frame.value().get(), &info, &stale_obj);
+      if (stale_obj != nullptr) {
+        self->GetJniEnv()->DeleteGlobalRef(stale_obj);
       }
       if (has_return) {
+        return_value.SetJ(info.return_val_.j);
         ScopedLocalRef<jthread> thr(self->GetJniEnv(),
                                     self->GetJniEnv()->NewLocalRef(self->GetPeer()));
         art::ScopedThreadSuspension sts(self, art::ThreadState::kNative);
@@ -732,6 +729,53 @@ class JvmtiMethodTraceListener final : public art::instrumentation::Instrumentat
           art::jni::EncodeArtMethod(method),
           /*was_popped_by_exception=*/ static_cast<jboolean>(JNI_FALSE),
           val);
+    }
+  }
+
+  // SCANNER: Supplies the forced return value when a frame is force-popped, independently of
+  // method-exit event delivery (which is skipped e.g. for frames deoptimized from a method-exit
+  // hook). Also called when a pending debugger shadow frame is discarded, to release the entry.
+  void NonStandardExitPopped(art::Thread* self,
+                             const art::ShadowFrame& frame,
+                             art::JValue& return_value)
+      REQUIRES_SHARED(art::Locks::mutator_lock_) override {
+    if (!event_handler_->IsEventEnabledAnywhere(
+            ArtJvmtiEvent::kForceEarlyReturnUpdateReturnValue)) {
+      return;
+    }
+    NonStandardExitEventInfo info;
+    jobject stale_obj = nullptr;
+    bool has_return = TakeNonStandardExit(self, &frame, &info, &stale_obj);
+    if (stale_obj != nullptr) {
+      self->GetJniEnv()->DeleteGlobalRef(stale_obj);
+    }
+    if (!has_return) {
+      return;
+    }
+    // Keep a reference result in a handle: disabling the internal event below can suspend.
+    art::StackHandleScope<1> hs(self);
+    art::MutableHandle<art::mirror::Object> obj_result(hs.NewHandle<art::mirror::Object>(nullptr));
+    const bool is_object = frame.GetMethod()
+                               ->GetInterfaceMethodIfProxy(art::kRuntimePointerSize)
+                               ->GetReturnTypePrimitive() == art::Primitive::kPrimNot;
+    if (is_object) {
+      obj_result.Assign(info.return_val_obj_ != nullptr ? self->DecodeJObject(info.return_val_obj_)
+                                                        : nullptr);
+    } else {
+      return_value.SetJ(info.return_val_.j);
+    }
+    {
+      ScopedLocalRef<jthread> thr(self->GetJniEnv(),
+                                  self->GetJniEnv()->NewLocalRef(self->GetPeer()));
+      art::ScopedThreadSuspension sts(self, art::ThreadState::kNative);
+      if (info.return_val_obj_ != nullptr) {
+        self->GetJniEnv()->DeleteGlobalRef(info.return_val_obj_);
+      }
+      event_handler_->SetInternalEvent(
+          thr.get(), ArtJvmtiEvent::kForceEarlyReturnUpdateReturnValue, JVMTI_DISABLE);
+    }
+    if (is_object) {
+      return_value.SetL(obj_result.Get());
     }
   }
 
@@ -1045,7 +1089,35 @@ class JvmtiMethodTraceListener final : public art::instrumentation::Instrumentat
     jobject return_val_obj_;
     // The return-value to be passed to the MethodExit event.
     jvalue return_val_;
+    // SCANNER: method of the frame the value was forced on. Entries are keyed by ShadowFrame
+    // address, which is reused by later frames; an entry whose method doesn't match the frame
+    // being popped is stale and must never be applied.
+    art::ArtMethod* method_;
   };
+
+  // SCANNER: Removes the pending forced return for `frame`. Returns true and fills the outputs if
+  // there was one for this exact frame. A stale entry left at the same address by a different
+  // method is dropped (its global ref is returned in *stale_obj for the caller to delete).
+  bool TakeNonStandardExit(art::Thread* self,
+                           const art::ShadowFrame* frame,
+                           /*out*/ NonStandardExitEventInfo* info,
+                           /*out*/ jobject* stale_obj)
+      REQUIRES_SHARED(art::Locks::mutator_lock_) {
+    art::MutexLock mu(self, non_standard_exits_lock_);
+    *stale_obj = nullptr;
+    const auto it = non_standard_exits_.find(frame);
+    if (it == non_standard_exits_.end()) {
+      return false;
+    }
+    NonStandardExitEventInfo found = it->second;
+    non_standard_exits_.erase(it);
+    if (found.method_ != frame->GetMethod()) {
+      *stale_obj = found.return_val_obj_;
+      return false;
+    }
+    *info = found;
+    return true;
+  }
 
   EventHandler* const event_handler_;
 
@@ -1603,6 +1675,10 @@ void EventHandler::AddDelayedNonStandardExitEvent(const art::ShadowFrame *frame,
                                                   bool is_object,
                                                   jvalue val) {
   method_trace_listener_->AddDelayedNonStandardExitEvent(frame, is_object, val);
+}
+
+bool EventHandler::HasDelayedNonStandardExitEvent(const art::ShadowFrame* frame) {
+  return method_trace_listener_->HasDelayedNonStandardExitEvent(frame);
 }
 
 static size_t GetInternalEventIndex(ArtJvmtiEvent event) {

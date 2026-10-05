@@ -541,7 +541,17 @@ ShadowFrame* Thread::FindOrCreateDebuggerShadowFrame(size_t frame_id,
                                                      uint32_t dex_pc) {
   ShadowFrame* shadow_frame = FindDebuggerShadowFrame(frame_id);
   if (shadow_frame != nullptr) {
-    return shadow_frame;
+    if (shadow_frame->GetMethod() == method) {
+      return shadow_frame;
+    }
+    // SCANNER: Debugger shadow frames are keyed by frame height only. One registered for a
+    // different method is a leftover from a frame that was never deoptimized; reusing it would run
+    // `method` with another method's state (and possibly a pending forced pop). Discard it.
+    LOG(WARNING) << "Discarding stale debugger shadow frame for "
+                 << ArtMethod::PrettyMethod(shadow_frame->GetMethod()) << " at frame " << frame_id
+                 << " (now " << ArtMethod::PrettyMethod(method) << ")";
+    RemoveDebuggerShadowFrameMapping(frame_id);
+    ShadowFrame::DeleteDeoptimizedFrame(shadow_frame);
   }
   VLOG(deopt) << "Create pre-deopted ShadowFrame for " << ArtMethod::PrettyMethod(method);
   shadow_frame = ShadowFrame::CreateDeoptimizedFrame(num_vregs, method, dex_pc);

@@ -67,8 +67,10 @@
 #include "jvalue-inl.h"
 #include "jvalue.h"
 #include "jvmti.h"
+#include "mirror/class-inl.h"
 #include "mirror/class.h"
 #include "mirror/dex_cache.h"
+#include "mirror/iftable-inl.h"
 #include "mirror/object-inl.h"
 #include "nativehelper/scoped_local_ref.h"
 #include "reflection-inl.h"
@@ -1166,7 +1168,13 @@ class NonStandardExitFrames {
     final_frame.WalkStack();
     penultimate_frame.WalkStack();
 
-    if (!final_frame.FoundFrame() || !penultimate_frame.FoundFrame()) {
+    // SCANNER: PopFrame has to re-execute the invoke in the caller, so it needs a Java caller frame.
+    // A forced return only needs the frame being returned from: when it is the bottom Java frame
+    // (entered from native code, e.g. Thread.run or a JNI upcall) the value simply goes back to
+    // native code, exactly like the native-caller case below. Upstream rejected this with
+    // NO_MORE_FRAMES even though frame 0 exists.
+    if (!final_frame.FoundFrame() ||
+        (kExitType == NonStandardExitType::kPopFrame && !penultimate_frame.FoundFrame())) {
       // Cannot do it if there is only one frame!
       JVMTI_LOG(INFO, env) << "Can not pop final frame off of a stack";
       result_ = ERR(NO_MORE_FRAMES);
@@ -1174,24 +1182,50 @@ class NonStandardExitFrames {
     }
 
     art::ArtMethod* called_method = final_frame.GetMethod();
-    art::ArtMethod* calling_method = penultimate_frame.GetMethod();
+    art::ArtMethod* calling_method =
+        penultimate_frame.FoundFrame() ? penultimate_frame.GetMethod() : nullptr;
     if (!CheckFunctions(env, calling_method, called_method)) {
       return;
     }
     DCHECK(!called_method->IsNative()) << called_method->PrettyMethod();
+
+    // SCANNER: A compiled frame can only be popped by deoptimizing it into the debugger shadow
+    // frame we create below. If the code can't be deoptimized that shadow frame never runs: the
+    // method silently keeps executing and the shadow frame stays registered at this frame height,
+    // where it later gets picked up by an unrelated method. Fail loudly instead. (In a debuggable
+    // app the frame at a method-entry/breakpoint hook is always interpreted or debuggable JIT, so
+    // this only triggers for frames that predate the debugger, e.g. zygote frames.)
+    auto is_poppable = [](FindFrameAtDepthVisitor& v) REQUIRES_SHARED(art::Locks::mutator_lock_) {
+      return v.IsShadowFrame() ||
+             art::Runtime::Current()->IsAsyncDeoptimizeable(v.GetOuterMethod(),
+                                                             v.GetCurrentQuickFramePc());
+    };
+    if (!is_poppable(final_frame) ||
+        (kExitType == NonStandardExitType::kPopFrame && !is_poppable(penultimate_frame))) {
+      JVMTI_LOG(INFO, env) << "Cannot pop " << called_method->PrettyMethod()
+                           << ": compiled frame cannot be deoptimized";
+      result_ = ERR(OPAQUE_FRAME);
+      return;
+    }
 
     // From here we are sure to succeed.
     result_ = OK;
 
     // Get/create a shadow frame
     final_frame_ = final_frame.GetOrCreateShadowFrame(&created_final_frame_);
+    // SCANNER: Only PopFrame needs the caller's shadow frame (to re-execute the invoke). A forced
+    // return just hands the value back to the caller like a normal return, so creating a debugger
+    // shadow frame for the caller is unnecessary, and it leaked whenever the caller wasn't
+    // deoptimized before the frame was unwound.
     penultimate_frame_ =
-        (calling_method->IsNative()
+        ((kExitType != NonStandardExitType::kPopFrame || calling_method->IsNative())
              ? nullptr
              : penultimate_frame.GetOrCreateShadowFrame(&created_penultimate_frame_));
 
     final_frame_id_ = final_frame.GetFrameId();
-    penultimate_frame_id_ = penultimate_frame.GetFrameId();
+    if (calling_method != nullptr) {
+      penultimate_frame_id_ = penultimate_frame.GetFrameId();
+    }
 
     CHECK_NE(final_frame_, penultimate_frame_) << "Frames at different depths not different!";
   }
@@ -1326,17 +1360,37 @@ bool UnboxForcedReturnNoThrow(art::ObjPtr<art::mirror::Object> o,
   return art::ConvertPrimitiveValueNoThrow(src_type, dst_type, boxed, out);
 }
 
-bool CoercePrimitiveForcedReturn(art::ObjPtr<art::mirror::Class> rt,
+// SCANNER: The forced-return checks below work from the method's return descriptor/shorty and
+// never resolve the return type. ResolveReturnType() can load classes (we hold the thread-list and
+// user-code-suspension locks here) and returns null with a pending exception when the class can't
+// be resolved, which used to crash the coercion. Nothing here allocates or suspends.
+
+// True if `klass` is, extends, or implements the type named by `descriptor`.
+bool IsSubtypeOfDescriptor(art::ObjPtr<art::mirror::Class> klass, const char* descriptor)
+    REQUIRES_SHARED(art::Locks::mutator_lock_) {
+  for (art::ObjPtr<art::mirror::Class> k = klass; k != nullptr; k = k->GetSuperClass()) {
+    if (k->DescriptorEquals(descriptor)) {
+      return true;
+    }
+  }
+  art::ObjPtr<art::mirror::IfTable> iftable = klass->GetIfTable();
+  for (int32_t i = 0, count = klass->GetIfTableCount(); i < count; ++i) {
+    if (iftable->GetInterface(i)->DescriptorEquals(descriptor)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool CoercePrimitiveForcedReturn(art::ArtMethod* method,
                                  art::Primitive::Type src_type,
                                  const art::JValue& src,
                                  jvalue* out_val,
                                  bool* out_is_object)
     REQUIRES_SHARED(art::Locks::mutator_lock_) {
-  if (!rt->IsPrimitive()) {
-    return false;
-  }
-  art::Primitive::Type dst_type = rt->GetPrimitiveType();
-  if (dst_type == art::Primitive::kPrimVoid) {
+  art::Primitive::Type dst_type =
+      method->GetInterfaceMethodIfProxy(art::kRuntimePointerSize)->GetReturnTypePrimitive();
+  if (dst_type == art::Primitive::kPrimNot || dst_type == art::Primitive::kPrimVoid) {
     return false;
   }
   art::JValue converted;
@@ -1359,51 +1413,53 @@ bool CoercePrimitiveForcedReturn(art::ObjPtr<art::mirror::Class> rt,
 }
 
 bool CoerceForcedReturnValue([[maybe_unused]] art::Thread* self,
-                             art::ObjPtr<art::mirror::Class> rt,
+                             art::ArtMethod* method,
                              jint value, jvalue* out_val, bool* out_is_object)
     REQUIRES_SHARED(art::Locks::mutator_lock_) {
   art::JValue src;
   src.SetI(value);
-  return CoercePrimitiveForcedReturn(rt, art::Primitive::kPrimInt, src, out_val, out_is_object);
+  return CoercePrimitiveForcedReturn(method, art::Primitive::kPrimInt, src, out_val, out_is_object);
 }
 
 bool CoerceForcedReturnValue([[maybe_unused]] art::Thread* self,
-                             art::ObjPtr<art::mirror::Class> rt,
+                             art::ArtMethod* method,
                              jlong value, jvalue* out_val, bool* out_is_object)
     REQUIRES_SHARED(art::Locks::mutator_lock_) {
   art::JValue src;
   src.SetJ(value);
-  return CoercePrimitiveForcedReturn(rt, art::Primitive::kPrimLong, src, out_val, out_is_object);
+  return CoercePrimitiveForcedReturn(method, art::Primitive::kPrimLong, src, out_val, out_is_object);
 }
 
 bool CoerceForcedReturnValue([[maybe_unused]] art::Thread* self,
-                             art::ObjPtr<art::mirror::Class> rt,
+                             art::ArtMethod* method,
                              jfloat value, jvalue* out_val, bool* out_is_object)
     REQUIRES_SHARED(art::Locks::mutator_lock_) {
   art::JValue src;
   src.SetF(value);
-  return CoercePrimitiveForcedReturn(rt, art::Primitive::kPrimFloat, src, out_val, out_is_object);
+  return CoercePrimitiveForcedReturn(method, art::Primitive::kPrimFloat, src, out_val, out_is_object);
 }
 
 bool CoerceForcedReturnValue([[maybe_unused]] art::Thread* self,
-                             art::ObjPtr<art::mirror::Class> rt,
+                             art::ArtMethod* method,
                              jdouble value, jvalue* out_val, bool* out_is_object)
     REQUIRES_SHARED(art::Locks::mutator_lock_) {
   art::JValue src;
   src.SetD(value);
-  return CoercePrimitiveForcedReturn(rt, art::Primitive::kPrimDouble, src, out_val, out_is_object);
+  return CoercePrimitiveForcedReturn(method, art::Primitive::kPrimDouble, src, out_val, out_is_object);
 }
 
 bool CoerceForcedReturnValue(art::Thread* self,
-                             art::ObjPtr<art::mirror::Class> rt,
+                             art::ArtMethod* method,
                              jobject value, jvalue* out_val, bool* out_is_object)
     REQUIRES_SHARED(art::Locks::mutator_lock_) {
+  art::ArtMethod* m = method->GetInterfaceMethodIfProxy(art::kRuntimePointerSize);
+  art::Primitive::Type dst_type = m->GetReturnTypePrimitive();
   art::ObjPtr<art::mirror::Object> obj = self->DecodeJObject(value);
-  if (rt->IsPrimitive()) {
-    art::Primitive::Type dst_type = rt->GetPrimitiveType();
+  if (dst_type != art::Primitive::kPrimNot) {
     if (dst_type == art::Primitive::kPrimVoid) {
       return false;
     }
+    // Boxed value for a primitive method: unbox (and widen) it.
     art::JValue converted;
     if (!UnboxForcedReturnNoThrow(obj, dst_type, &converted)) {
       return false;
@@ -1412,8 +1468,14 @@ bool CoerceForcedReturnValue(art::Thread* self,
     *out_is_object = false;
     return true;
   }
-  if (obj != nullptr && !rt->IsAssignableFrom(obj->GetClass())) {
-    return false;
+  if (obj != nullptr) {
+    art::ObjPtr<art::mirror::Class> rt = m->LookupResolvedReturnType();
+    bool assignable = (rt != nullptr) ? rt->IsAssignableFrom(obj->GetClass())
+                                      : IsSubtypeOfDescriptor(obj->GetClass(),
+                                                              m->GetReturnTypeDescriptor());
+    if (!assignable) {
+      return false;
+    }
   }
   out_val->l = value;
   *out_is_object = true;
@@ -1421,14 +1483,17 @@ bool CoerceForcedReturnValue(art::Thread* self,
 }
 
 bool CoerceForcedReturnValue([[maybe_unused]] art::Thread* self,
-                             art::ObjPtr<art::mirror::Class> rt,
+                             art::ArtMethod* method,
                              [[maybe_unused]] std::nullptr_t value,
                              jvalue* out_val, bool* out_is_object)
     REQUIRES_SHARED(art::Locks::mutator_lock_) {
-  if (rt->IsPrimitive()) {
+  // ForceEarlyReturnVoid: exact for void methods; for reference methods it means null.
+  art::Primitive::Type dst_type =
+      method->GetInterfaceMethodIfProxy(art::kRuntimePointerSize)->GetReturnTypePrimitive();
+  if (dst_type != art::Primitive::kPrimNot) {
     memset(out_val, 0, sizeof(*out_val));
     *out_is_object = false;
-    return rt->GetPrimitiveType() == art::Primitive::kPrimVoid;
+    return dst_type == art::Primitive::kPrimVoid;
   }
   out_val->l = nullptr;
   *out_is_object = true;
@@ -1484,7 +1549,7 @@ StackUtil::ForceEarlyReturn(jvmtiEnv* env, EventHandler* event_handler, jthread 
   jvalue coerced_val;
   bool coerced_is_object = false;
   if (!CoerceForcedReturnValue(self,
-                               frames.final_frame_->GetMethod()->ResolveReturnType(),
+                               frames.final_frame_->GetMethod(),
                                value,
                                &coerced_val,
                                &coerced_is_object)) {
@@ -1493,13 +1558,24 @@ StackUtil::ForceEarlyReturn(jvmtiEnv* env, EventHandler* event_handler, jthread 
     return ERR(TYPE_MISMATCH);
   }
   if (frames.final_frame_->GetForcePopFrame()) {
-    // TODO We should really support this.
+    if (!event_handler->HasDelayedNonStandardExitEvent(frames.final_frame_)) {
+      // A PopFrame is pending (it has also marked the caller to retry the invoke); a forced
+      // return can't be layered on top of that.
+      smee.NotifyFailure();
+      std::string thread_name;
+      frames.target_->GetThreadName(thread_name);
+      JVMTI_LOG(WARNING, env) << "PopFrame already pending on thread " << thread_name;
+      art::Locks::thread_list_lock_->ExclusiveUnlock(self);
+      return ERR(OPAQUE_FRAME);
+    }
+    // SCANNER: A forced return is already pending on this frame. Replace its value (last call
+    // wins) instead of failing. The internal exit event is already enabled for that pending
+    // return and is disabled once when the frame pops, so drop the extra enable taken by smee.
     smee.NotifyFailure();
-    std::string thread_name;
-    frames.target_->GetThreadName(thread_name);
-    JVMTI_LOG(WARNING, env) << "PopFrame or force-return already pending on thread " << thread_name;
+    event_handler->AddDelayedNonStandardExitEvent(
+        frames.final_frame_, coerced_is_object, coerced_val);
     art::Locks::thread_list_lock_->ExclusiveUnlock(self);
-    return ERR(OPAQUE_FRAME);
+    return OK;
   }
   // Tell the shadow-frame to return immediately and skip all exit events.
   frames.final_frame_->SetForcePopFrame(true);

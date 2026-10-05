@@ -153,6 +153,16 @@ struct InstrumentationListener {
   virtual void WatchedFramePop([[maybe_unused]] Thread* thread,
                                [[maybe_unused]] const ShadowFrame& frame)
       REQUIRES_SHARED(Locks::mutator_lock_) = 0;
+
+  // SCANNER: Call-back when `frame` is removed by a non-standard exit (force-early-return or
+  // pop-frame), or when a pending debugger shadow frame is discarded without being executed.
+  // Unlike MethodExited this is delivered even when method-exit events are skipped for the frame
+  // (e.g. after a deoptimization from a method-exit hook), so a listener that set up a forced
+  // return value can always supply it in `return_value` (and release its bookkeeping).
+  virtual void NonStandardExitPopped([[maybe_unused]] Thread* thread,
+                                     [[maybe_unused]] const ShadowFrame& frame,
+                                     [[maybe_unused]] JValue& return_value)
+      REQUIRES_SHARED(Locks::mutator_lock_) {}
 };
 
 class Instrumentation;
@@ -532,6 +542,12 @@ class Instrumentation {
       WatchedFramePopImpl(thread, frame);
     }
   }
+
+  // SCANNER: Inform method-exit listeners that `frame` was popped by a non-standard exit (or is
+  // being discarded) so they can supply/release a forced return value. See
+  // InstrumentationListener::NonStandardExitPopped.
+  void NonStandardExitPoppedEvent(Thread* thread, const ShadowFrame& frame, JValue& return_value)
+      const REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Inform listeners that an exception was thrown.
   void ExceptionThrownEvent(Thread* thread, ObjPtr<mirror::Throwable> exception_object) const

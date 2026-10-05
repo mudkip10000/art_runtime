@@ -304,6 +304,11 @@ class EventHandler {
       REQUIRES_SHARED(art::Locks::mutator_lock_)
       REQUIRES(art::Locks::user_code_suspension_lock_, art::Locks::thread_list_lock_);
 
+  // SCANNER: True if a forced return value is pending for `frame` (as opposed to a PopFrame).
+  bool HasDelayedNonStandardExitEvent(const art::ShadowFrame* frame)
+      REQUIRES_SHARED(art::Locks::mutator_lock_)
+      REQUIRES(art::Locks::user_code_suspension_lock_, art::Locks::thread_list_lock_);
+
   template<typename Visitor>
   void ForEachEnv(art::Thread* self, Visitor v) REQUIRES(!envs_lock_) {
     art::ReaderMutexLock mu(self, envs_lock_);

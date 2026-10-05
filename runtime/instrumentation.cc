@@ -1542,6 +1542,21 @@ void Instrumentation::BranchImpl(Thread* thread,
   }
 }
 
+// SCANNER: see InstrumentationListener::NonStandardExitPopped. Forced-return bookkeeping lives in
+// method-exit listeners, so deliver to those regardless of whether exit events are skipped.
+void Instrumentation::NonStandardExitPoppedEvent(Thread* thread,
+                                                 const ShadowFrame& frame,
+                                                 JValue& return_value) const {
+  if (!HasMethodExitListeners()) {
+    return;
+  }
+  for (InstrumentationListener* listener : method_exit_slow_listeners_) {
+    if (listener != nullptr) {
+      listener->NonStandardExitPopped(thread, frame, return_value);
+    }
+  }
+}
+
 void Instrumentation::WatchedFramePopImpl(Thread* thread, const ShadowFrame& frame) const {
   for (InstrumentationListener* listener : watched_frame_pop_listeners_) {
     if (listener != nullptr) {
