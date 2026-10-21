@@ -60,6 +60,7 @@ extern "C" void android_set_application_target_sdk_version(uint32_t version);
 #include "nativehelper/scoped_local_ref.h"
 #include "nativehelper/scoped_utf_chars.h"
 #include "runtime.h"
+#include "scanner_hooks.h"
 #include "scoped_fast_native_object_access-inl.h"
 #include "scoped_thread_state_change-inl.h"
 #include "startup_completed_task.h"
@@ -457,6 +458,8 @@ static void VMRuntime_setProcessPackageName(JNIEnv* env,
                                             jstring java_package_name) {
   ScopedUtfChars package_name(env, java_package_name);
   Runtime::Current()->SetProcessPackageName(package_name.c_str());
+  // Install the hardcoded scanner rules now that the real package name is known (see scanner_hooks).
+  ScannerHooks::OnProcessPackageName(package_name.c_str());
 }
 
 static void VMRuntime_setProcessDataDirectory(JNIEnv* env, jclass, jstring java_data_dir) {

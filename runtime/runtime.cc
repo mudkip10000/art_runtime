@@ -169,6 +169,7 @@
 #include "runtime_image.h"
 #include "runtime_intrinsics.h"
 #include "runtime_options.h"
+#include "scanner_hooks.h"
 #include "scoped_thread_state_change-inl.h"
 #include "sigchain.h"
 #include "signal_catcher.h"
@@ -1338,6 +1339,13 @@ void Runtime::InitNonZygoteOrPostFork(
   ATraceIntegerValue(
       "profilebootclasspath",
       static_cast<int>(jit_options_->GetProfileSaverOptions().GetProfileBootClassPath()));
+  // Install the hardcoded method/field interception rules. Applied to app processes only;
+  // system_server and the zygotes are excluded. The thread is in kNative here (JNI post-fork
+  // context), which Install() requires for its ScopedObjectAccess transition.
+  if (!is_system_server) {
+    ScannerHooks::Install();
+  }
+
   // Start the JDWP thread. If the command-line debugger flags specified "suspend=y",
   // this will pause the runtime (in the internal debugger implementation), so we probably want
   // this to come last.
