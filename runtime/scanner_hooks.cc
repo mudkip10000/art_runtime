@@ -8,8 +8,10 @@
 #include "scanner_hooks.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -35,10 +37,14 @@
 #include "mirror/class-inl.h"
 #include "mirror/iftable.h"
 #include "mirror/object-inl.h"
+#include "mirror/object_array-inl.h"
+#include "mirror/object_array-alloc-inl.h"
+#include "mirror/array-inl.h"
 #include "mirror/string.h"
 #include "runtime.h"
 #include "runtime_callbacks.h"
 #include "scoped_thread_state_change-inl.h"
+#include "stack_reference.h"
 #include "thread.h"
 #include "thread-inl.h"
 #include "thread_list.h"
@@ -46,6 +52,35 @@
 namespace art {
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Generic string constants
+// ---------------------------------------------------------------------------
+// Plumbing used by the engine helpers below regardless of any particular rule. Constants tied to a
+// specific rule's behaviour (spoofed values, the fields a mutate rule rewrites, an action's target
+// object) live next to the rules in scanner_hooks_rules.inc instead.
+
+// java.lang.String type descriptor, used to resolve String fields by (name, type).
+constexpr const char* kStringDescriptor = "Ljava/lang/String;";
+
+// android.os.Debug.waitForDebugger(), resolved once for the debugger-detection gate.
+constexpr const char* kDebugDescriptor = "Landroid/os/Debug;";
+constexpr const char* kWaitForDebuggerName = "waitForDebugger";
+constexpr const char* kVoidNoArgsSignature = "()V";
+
+// Process names the zygote carries before specialization (not yet a real app process).
+constexpr const char* kZygoteProcName = "zygote";
+constexpr const char* kZygote64ProcName = "zygote64";
+
+// System-property keys the scanner sets during device setup to configure these hooks.
+constexpr const char* kPropTarget = "dalvik.vm.scanner-target";
+constexpr const char* kPropRasp = "dalvik.vm.scanner-rasp";
+constexpr const char* kPropSsl = "dalvik.vm.scanner-ssl";
+constexpr const char* kPropPackage = "dalvik.vm.scanner-package";
+constexpr const char* kPropSecureFlag = "dalvik.vm.scanner-secure-flag";
+constexpr const char* kPropDebugger = "dalvik.vm.scanner-debugger";
+constexpr const char* kPropSignature = "dalvik.vm.scanner-signature";
+constexpr const char* kPropVerbose = "dalvik.vm.scanner-verbose";
 
 // ---------------------------------------------------------------------------
 // Rule table
@@ -59,6 +94,8 @@ enum class RuleCategory {
   kPackageManipulation,  // installer / package identity
   kSecureFlagBypass,     // FLAG_SECURE and screenshot restrictions
   kDebuggerBypass,       // debugger detection; applied only while a JDWP debugger is attached
+  kSignatureSpoof,       // signature / certificate spoofing (the fabricated Google-package
+                         // getPackageInfo response, built off an embedded Google signing cert).
 };
 
 enum class ActionKind {
@@ -72,12 +109,24 @@ enum class ActionKind {
   kFieldSetString,  // set a String field once at class-prepare
   kCallbackMutate,  // run a native callback (int_value selects it) that mutates arg/this state,
                     // then let the method run unmodified (no force-return)
+  kCallbackReturn,  // run a native callback (int_value selects it) that COMPUTES a return value
+                    // (may invoke managed code); on success force-return it, on failure no-op
+  kCallbackMutateReturn,  // on MethodExited, run a native callback (int_value selects it) that
+                          // mutates the returned object in place; method otherwise runs normally
 };
 
-// Callback ids for kCallbackMutate rules (stored in Rule::int_value).
+// Callback ids for kCallbackMutate / kCallbackReturn / kCallbackMutateReturn rules (Rule::int_value).
 enum CallbackId {
   kCbBindServiceSpoof = 1,  // rewrite the Intent's target package on a Play Integrity / SafetyNet bind
   kCbClearSecureFlag = 2,   // clear FLAG_SECURE from a Window.addFlags/setFlags int argument
+  // kCallbackReturn (compute + force-return):
+  kCbCheckServerTrustedList = 3,  // X509TrustManager.checkServerTrusted(List): return Arrays.asList(chain)
+  kCbWebViewProceed = 4,          // WebViewClient.onReceivedSslError: handler.proceed(), return void
+  kCbFakeGooglePackageInfo = 5,   // getPackageInfo("com.android.vending"/gms): return fake Google PackageInfo
+  // kCallbackMutate (mutate state, then run):
+  kCbSslPeerUnverifiedStepOut = 8, // SSLPeerUnverifiedException.<init>: force the void-returning caller to return
+  // kCallbackMutateReturn (mutate returned object on exit):
+  kCbClearApplicationInfoDebuggable = 9,  // ApplicationInfo returned by getApplicationInfo: clear FLAG_DEBUGGABLE
 };
 
 struct Rule {
@@ -113,246 +162,12 @@ struct Rule {
   char return_shorty;
 };
 
-// --- argument value arrays (SystemProperties keys etc.) ---------------------
-const char* const kPropDebuggableBool[] = {"ro.debuggable", "ro.boot.qemu",
-                                           "debug.choreographer.vsync"};
-const char* const kPropDebuggableQemu[] = {"ro.debuggable", "ro.boot.qemu"};
-const char* const kPropDebuggableKernelQemu[] = {"ro.debuggable", "ro.kernel.qemu"};
-const char* const kPropSecureBoot[] = {"ro.adb.secure", "ro.secure", "ro.boot.flash.locked"};
-const char* const kPropBrand[] = {"ro.product.brand", "ro.product.manufacturer"};
-const char* const kPropHardware[] = {"ro.hardware", "ro.product.name"};
-const char* const kPropDevice[] = {"ro.product.device", "ro.product.model"};
-const char* const kPropSkipWarn[] = {"debug.choreographer.skipwarning"};
-const char* const kPropBuildType[] = {"ro.build.type"};
-const char* const kPropBootState[] = {"ro.boot.verifiedbootstate"};
-const char* const kPropBuildFingerprint[] = {"ro.build.fingerprint"};
-const char* const kPropBuildTags[] = {"ro.build.tags"};
-const char* const kPropEmulator[] = {
-    "init.svc.qemu-adb-keys", "init.svc.qemu-adb-setup", "init.svc.qemu-device-state",
-    "init.svc.qemu-props", "init.svc_debug_pid.qemu-adb-keys",
-    "init.svc_debug_pid.qemu-adb-setup", "init.svc_debug_pid.qemu-device-state",
-    "init.svc_debug_pid.qemu-props", "qemu.hw.mainkeys", "qemu.sf.lcd_density",
-    "ro.boot.qemu.avd_name", "ro.boot.qemu.camera_hq_edge_processing",
-    "ro.boot.qemu.camera_protocol_ver", "ro.boot.qemu.cpuvulkan.version",
-    "ro.boot.qemu.gltransport.drawFlushInterval", "ro.boot.qemu.gltransport.name",
-    "ro.boot.qemu.hwcodec.avcdec", "ro.boot.qemu.hwcodec.hevcdec",
-    "ro.boot.qemu.hwcodec.vpxdec", "ro.boot.qemu.settings.system.screen_off_timeout",
-    "ro.boot.qemu.skin", "ro.boot.qemu.virtiowifi", "ro.boot.qemu.vsync", "ro.boot.qemu",
-    "ro.boottime.qemu-adb-keys", "ro.boottime.qemu-adb-setup", "ro.boottime.qemu-device-state",
-    "ro.boottime.qemu-props", "vendor.qemu.dev.bootcomplete", "vendor.qemu.sf.fake_camera",
-    "vendor.qemu.timezone", "vendor.qemu.vport.bluetooth", "vendor.qemu.vport.modem"};
-const char* const kSettingsSecure[] = {"install_non_market_apps",
-                                       "unknown_sources_default_reversed"};
-const char* const kSettingsPlayStore[] = {"phone_play_store_availability",
-                                          "verifier_verify_adb_installs"};
-const char* const kSettingsAdb[] = {"adb_enabled", "adb_wifi_enabled", "upload_apk_enable"};
-// Service actions whose bind is redirected away from the real Play/GMS package.
-const char* const kIntegrityBindActions[] = {
-    "com.google.android.play.core.integrityservice.BIND_INTEGRITY_SERVICE",
-    "com.google.android.gms.safetynet.service.START"};
-// Root/emulator artifact paths; java.io.File.exists() on any of these is forced to false.
-const char* const kRootPaths[] = {
-    "/cache/magisk", "/data/adb/magisk", "/data/local/bin/su", "/data/local/su",
-    "/data/local/xbin/su", "/sbin/.magisk", "/sbin/magisk", "/sbin/su", "/su/bin/su", "/su/bin",
-    "/system/app/Superuser.apk", "/system/bin/.ext", "/system/bin/.su",
-    "/system/bin/failsafe/su", "/system/bin/frida-server", "/system/bin/magisk",
-    "/system/bin/su", "/system/framework/XposedBridge.jar", "/system/lib/libriruloader.so",
-    "/system/lib/libxposed.so", "/system/lib64/libxposed.so", "/system/sd/xbin/su",
-    "/system/usr/we-need-root/", "/system/xbin/.ext", "/system/xbin/daemonsu",
-    "/system/xbin/magisk", "/system/xbin/su", "/vendor/bin/su",
-    "/dev/goldfish_pipe", "/dev/qemu_pipe", "/proc/tty/drivers",
-    "/system_ext/bin/init.qemu-adb-keys.sh", "/vendor/bin/qemu-adb-keys",
-    "/vendor/bin/qemu-device-state", "/vendor/bin/qemu-props",
-    "/vendor/lib64/libqemupipe.ranchu.so"};
-
 constexpr int kNoArg = -1;
 
-#define ARR(a) (a), static_cast<int>(sizeof(a) / sizeof((a)[0]))
-
-const char kFingerprint[] =
-    "google/exynos2100/pixel:14/google/google:user/release-keys";
-
-// The rule table. A method-name pattern that matches several names is expanded to one row per
-// name. A row with is_field set spoofs a static field; otherwise it intercepts a method.
-#define RASP RuleCategory::kRaspBypass
-#define SSLB RuleCategory::kSslBypass
-#define PKG RuleCategory::kPackageManipulation
-#define DBG RuleCategory::kDebuggerBypass
-#define SEC RuleCategory::kSecureFlagBypass
-const Rule kRules[] = {
-    // android.os.Debug
-    // Debugger-detection rules live in their own category: they are spoofed only once a JDWP
-    // debugger has actually attached (see DebuggerAttached), so they never answer the framework's
-    // wait-for-debugger startup path with a premature "not connected".
-    {DBG, "Landroid/os/Debug;", "isDebuggerConnected", false, kNoArg, nullptr, 0,
-     ActionKind::kConstBool, false, 0, nullptr},
-    {DBG, "Landroid/os/Debug;", "waitingForDebugger", false, kNoArg, nullptr, 0,
-     ActionKind::kConstBool, false, 0, nullptr},
-
-    // android.os.Build fields
-    {RASP, "Landroid/os/Build;", "IS_ENG", true, kNoArg, nullptr, 0, ActionKind::kFieldSetBool,
-     false, 0, nullptr},
-    {RASP, "Landroid/os/Build;", "IS_USERDEBUG", true, kNoArg, nullptr, 0,
-     ActionKind::kFieldSetBool, false, 0, nullptr},
-    {RASP, "Landroid/os/Build;", "IS_DEBUGGABLE", true, kNoArg, nullptr, 0,
-     ActionKind::kFieldSetBool, false, 0, nullptr},
-    {RASP, "Landroid/os/Build;", "IS_EMULATOR", true, kNoArg, nullptr, 0,
-     ActionKind::kFieldSetBool, false, 0, nullptr},
-    {RASP, "Landroid/os/Build;", "IS_USER", true, kNoArg, nullptr, 0, ActionKind::kFieldSetBool,
-     true, 0, nullptr},
-    {RASP, "Landroid/os/Build;", "TAGS", true, kNoArg, nullptr, 0, ActionKind::kFieldSetString,
-     false, 0, "release-keys"},
-    {RASP, "Landroid/os/Build;", "BRAND", true, kNoArg, nullptr, 0, ActionKind::kFieldSetString,
-     false, 0, "google"},
-    {RASP, "Landroid/os/Build;", "MANUFACTURER", true, kNoArg, nullptr, 0,
-     ActionKind::kFieldSetString, false, 0, "google"},
-    {RASP, "Landroid/os/Build;", "PRODUCT", true, kNoArg, nullptr, 0, ActionKind::kFieldSetString,
-     false, 0, "exynos2100"},
-    {RASP, "Landroid/os/Build;", "HARDWARE", true, kNoArg, nullptr, 0, ActionKind::kFieldSetString,
-     false, 0, "exynos2100"},
-    {RASP, "Landroid/os/Build;", "FINGERPRINT", true, kNoArg, nullptr, 0,
-     ActionKind::kFieldSetString, false, 0, kFingerprint},
-    {RASP, "Landroid/os/Build;", "DEVICE", true, kNoArg, nullptr, 0, ActionKind::kFieldSetString,
-     false, 0, "pixel"},
-    {RASP, "Landroid/os/Build;", "MODEL", true, kNoArg, nullptr, 0, ActionKind::kFieldSetString,
-     false, 0, "pixel"},
-
-    // android.os.Build.getRadioVersion
-    {RASP, "Landroid/os/Build;", "getRadioVersion", false, kNoArg, nullptr, 0,
-     ActionKind::kConstString, false, 0, "exynos2100,exynos2100"},
-
-    // android.os.SystemProperties, gated by the property name argument
-    {RASP, "Landroid/os/SystemProperties;", "getBoolean", false, 0, ARR(kPropDebuggableBool),
-     ActionKind::kConstBool, false, 0, nullptr},
-    {RASP, "Landroid/os/SystemProperties;", "getInt", false, 0, ARR(kPropSkipWarn),
-     ActionKind::kConstInt, false, 100000000, nullptr},
-    {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropBuildType),
-     ActionKind::kConstString, false, 0, "user"},
-    {RASP, "Landroid/os/SystemProperties;", "getInt", false, 0, ARR(kPropDebuggableQemu),
-     ActionKind::kConstInt, false, 0, nullptr},
-    {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropDebuggableKernelQemu),
-     ActionKind::kConstString, false, 0, "0"},
-    {RASP, "Landroid/os/SystemProperties;", "getBoolean", false, 0, ARR(kPropSecureBoot),
-     ActionKind::kConstBool, true, 0, nullptr},
-    {RASP, "Landroid/os/SystemProperties;", "getInt", false, 0, ARR(kPropSecureBoot),
-     ActionKind::kConstInt, false, 1, nullptr},
-    {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropSecureBoot),
-     ActionKind::kConstString, false, 0, "1"},
-    {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropBootState),
-     ActionKind::kConstString, false, 0, "green"},
-    {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropBrand),
-     ActionKind::kConstString, false, 0, "google"},
-    {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropHardware),
-     ActionKind::kConstString, false, 0, "exynos2100"},
-    {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropBuildFingerprint),
-     ActionKind::kConstString, false, 0, kFingerprint},
-    {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropDevice),
-     ActionKind::kConstString, false, 0, "pixel"},
-    {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropBuildTags),
-     ActionKind::kConstString, false, 0, "release-keys"},
-    {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropEmulator),
-     ActionKind::kConstNull, false, 0, nullptr},
-
-    // android.provider.Settings.Secure / .Global getInt, gated by the setting name argument
-    {RASP, "Landroid/provider/Settings$Secure;", "getInt", false, 1, ARR(kSettingsSecure),
-     ActionKind::kConstInt, false, 0, nullptr},
-    {RASP, "Landroid/provider/Settings$Global;", "getInt", false, 1, ARR(kSettingsPlayStore),
-     ActionKind::kConstInt, false, 1, nullptr},
-    {RASP, "Landroid/provider/Settings$Global;", "getInt", false, 1, ARR(kSettingsAdb),
-     ActionKind::kConstInt, false, 0, nullptr},
-
-    // android.security.keystore.*
-    {RASP, "Landroid/security/keystore/KeyInfo;", "isInsideSecureHardware", false, kNoArg, nullptr,
-     0, ActionKind::kConstBool, true, 0, nullptr},
-    {RASP, "Landroid/security/keystore/KeyInfo;", "getSecurityLevel", false, kNoArg, nullptr, 0,
-     ActionKind::kConstInt, false, 2, nullptr},
-    {RASP, "Landroid/security/keystore/KeyGenParameterSpec;", "isStrongBoxBacked", false, kNoArg,
-     nullptr, 0, ActionKind::kConstBool, false, 0, nullptr},
-    {RASP, "Landroid/security/keystore/KeyProtection;", "isStrongBoxBacked", false, kNoArg, nullptr,
-     0, ActionKind::kConstBool, true, 0, nullptr},
-
-    // java.io.File.exists, forced to false when this.path is a root/emulator artifact.
-    {RASP, "Ljava/io/File;", "exists", false, kNoArg, ARR(kRootPaths), ActionKind::kConstBool,
-     false, 0, nullptr, "path"},
-
-    // android.hardware.SensorManager sensor enumeration -> empty list (emulators expose
-    // characteristic "Goldfish" sensors). getFullSensorList / getFullDynamicSensorList are
-    // abstract on SensorManager and concrete only on SystemSensorManager, so they target the impl.
-    {RASP, "Landroid/hardware/SensorManager;", "getSensorList", false, kNoArg, nullptr, 0,
-     ActionKind::kConstEmptyList, false, 0, nullptr},
-    {RASP, "Landroid/hardware/SystemSensorManager;", "getFullSensorList", false, kNoArg, nullptr, 0,
-     ActionKind::kConstEmptyList, false, 0, nullptr},
-    {RASP, "Landroid/hardware/SystemSensorManager;", "getFullDynamicSensorList", false, kNoArg,
-     nullptr, 0, ActionKind::kConstEmptyList, false, 0, nullptr},
-
-    // Package / signature identity checks (match PackageManager and its IPackageManager proxy, and
-    // their subtypes/implementors). Fields after this_field: match_subtypes, return_shorty.
-    {RASP, "Landroid/content/pm/PackageManager;", "hasSigningCertificate", false, kNoArg, nullptr,
-     0, ActionKind::kConstBool, true, 0, nullptr, nullptr, true, 'Z'},
-    {RASP, "Landroid/content/pm/IPackageManager;", "hasSigningCertificate", false, kNoArg, nullptr,
-     0, ActionKind::kConstBool, true, 0, nullptr, nullptr, true, 'Z'},
-    {RASP, "Landroid/content/pm/PackageManager;", "checkSignatures", false, kNoArg, nullptr, 0,
-     ActionKind::kConstInt, false, 0, nullptr, nullptr, true, 'I'},
-    {RASP, "Landroid/content/pm/IPackageManager;", "checkSignatures", false, kNoArg, nullptr, 0,
-     ActionKind::kConstInt, false, 0, nullptr, nullptr, true, 'I'},
-    {RASP, "Landroid/content/pm/Signature;", "equals", false, kNoArg, nullptr, 0,
-     ActionKind::kConstBool, true, 0, nullptr, nullptr, false, 'Z'},
-    {RASP, "Landroid/content/pm/SigningDetails;", "equals", false, kNoArg, nullptr, 0,
-     ActionKind::kConstBool, true, 0, nullptr, nullptr, false, 'Z'},
-
-    // SSL / TLS trust and hostname verification. These accept everything: void checks return
-    // without throwing, boolean verifications return true. Interface/base rules use match_subtypes
-    // so every app or library implementor is covered.
-    {SSLB, "Lorg/conscrypt/NativeCrypto$SSLHandshakeCallbacks;", "verifyCertificateChain", false,
-     kNoArg, nullptr, 0, ActionKind::kConstVoid, false, 0, nullptr, nullptr, true, 'V'},
-    {SSLB, "Lorg/conscrypt/ConscryptEngine;", "verifyCertificateChain", false, kNoArg, nullptr, 0,
-     ActionKind::kConstVoid, false, 0, nullptr, nullptr, false, 'V'},
-    {SSLB, "Ljavax/net/ssl/X509TrustManager;", "checkClientTrusted", false, kNoArg, nullptr, 0,
-     ActionKind::kConstVoid, false, 0, nullptr, nullptr, true, 'V'},
-    {SSLB, "Ljavax/net/ssl/X509TrustManager;", "checkServerTrusted", false, kNoArg, nullptr, 0,
-     ActionKind::kConstVoid, false, 0, nullptr, nullptr, true, 'V'},
-    {SSLB, "Lorg/apache/http/conn/ssl/X509HostnameVerifier;", "verify", false, kNoArg, nullptr, 0,
-     ActionKind::kConstVoid, false, 0, nullptr, nullptr, true, 'V'},
-    {SSLB, "Lsun/security/provider/certpath/PKIXMasterCertPathValidator;", "validate", false, kNoArg,
-     nullptr, 0, ActionKind::kConstVoid, false, 0, nullptr, nullptr, false, 'V'},
-    {SSLB, "Lorg/conscrypt/ConscryptHostnameVerifier;", "verify", false, kNoArg, nullptr, 0,
-     ActionKind::kConstBool, true, 0, nullptr, nullptr, true, 'Z'},
-    {SSLB, "Lorg/conscrypt/OkHostnameVerifier;", "verify", false, kNoArg, nullptr, 0,
-     ActionKind::kConstBool, true, 0, nullptr, nullptr, false, 'Z'},
-    {SSLB, "Ljavax/net/ssl/HostnameVerifier;", "verify", false, kNoArg, nullptr, 0,
-     ActionKind::kConstBool, true, 0, nullptr, nullptr, true, 'Z'},
-
-    // Redirect Play Integrity / SafetyNet service binds to a non-existent package so the bind
-    // fails cleanly. Mutates the Intent argument's package, then lets bindService run. Matches
-    // ContextImpl and ContextWrapper exactly (the two classes that declare bindService). int_value
-    // carries the callback id.
-    {PKG, "Landroid/app/ContextImpl;", "bindService", false, kNoArg, nullptr, 0,
-     ActionKind::kCallbackMutate, false, kCbBindServiceSpoof, nullptr},
-    {PKG, "Landroid/content/ContextWrapper;", "bindService", false, kNoArg, nullptr, 0,
-     ActionKind::kCallbackMutate, false, kCbBindServiceSpoof, nullptr},
-
-    // secure_flag_bypass: strip FLAG_SECURE (0x2000) from the Window flags argument so a screen can
-    // never be marked secure (blocking screenshots / screen capture). A mutate-and-proceed rule: it
-    // clears the bit in the primitive int argument in place, then lets the method run. addFlags(int)
-    // has the flags in arg 0; setFlags(int flags, int mask) has them in args 0 and 1 (clearing the
-    // mask bit leaves the real flag untouched rather than setting it).
-    {SEC, "Landroid/view/Window;", "addFlags", false, kNoArg, nullptr, 0,
-     ActionKind::kCallbackMutate, false, kCbClearSecureFlag, nullptr},
-    {SEC, "Landroid/view/Window;", "setFlags", false, kNoArg, nullptr, 0,
-     ActionKind::kCallbackMutate, false, kCbClearSecureFlag, nullptr},
-
-    // Not handled here (require invoking managed code from the hook, or mutating state and letting
-    // the method run — a different action style than constant force-return):
-    //  - getPackageInfo signature/Google-package spoofs: build PackageInfo / Signature[] / SigningInfo.
-    //  - X509TrustManager.checkServerTrusted (List overload): return Arrays.asList(chain).
-    //  - PackageParser.collectCertificates: set this.mSigningDetails to a built SigningDetails.
-    //  - WebViewClient.onReceivedSslError: call handler.proceed(), then return.
-    //  - SSLPeerUnverifiedException ctor: force the caller frame to return void (step-out).
-    //  - ApplicationInfo.flags: field-read transform (value & ~2); needs a read-time hook.
-};
-#undef RASP
-#undef SSLB
-#undef PKG
+// The rule table and its argument-value arrays are defined in scanner_hooks_rules.inc and textually
+// included here, inside the anonymous namespace, so the table keeps internal linkage and direct use
+// of the enums / Rule struct / kNoArg defined above.
+#include "scanner_hooks_rules.inc"
 
 // ---------------------------------------------------------------------------
 // Runtime state
@@ -382,6 +197,10 @@ std::atomic<bool> g_installed{false};
 // Global ref to java.util.Collections.EMPTY_LIST, resolved once at install; null if unresolved.
 jobject g_empty_list = nullptr;
 
+// Device API level (ro.build.version.sdk), read once at Install(). Used to pick version-specific
+// object shapes in the Google-package spoof (e.g. SigningDetails vs PackageParser.SigningDetails).
+int g_sdk_int = 0;
+
 // Configuration read from system properties at ScannerHooks::Install(). Hooks are installed only in
 // the process whose package matches g_target_package, and a rule applies only if its category is
 // enabled. The scanner sets these via setprop during device setup, e.g.:
@@ -393,6 +212,7 @@ bool g_cat_ssl = false;            // dalvik.vm.scanner-ssl
 bool g_cat_pkg = false;            // dalvik.vm.scanner-package
 bool g_cat_secure = false;         // dalvik.vm.scanner-secure-flag
 bool g_cat_debugger = false;       // dalvik.vm.scanner-debugger (deferred until a debugger attaches)
+bool g_cat_signature = false;      // dalvik.vm.scanner-signature (certificate / signature spoofing)
 bool g_verbose = false;            // dalvik.vm.scanner-verbose (log each rule that fires)
 
 bool CategoryEnabled(RuleCategory c) {
@@ -402,20 +222,25 @@ bool CategoryEnabled(RuleCategory c) {
     case RuleCategory::kPackageManipulation: return g_cat_pkg;
     case RuleCategory::kSecureFlagBypass: return g_cat_secure;
     case RuleCategory::kDebuggerBypass: return g_cat_debugger;
+    case RuleCategory::kSignatureSpoof: return g_cat_signature;
   }
   return false;
 }
 
 bool AnyCategoryEnabled() {
-  return g_cat_rasp || g_cat_ssl || g_cat_pkg || g_cat_secure || g_cat_debugger;
+  return g_cat_rasp || g_cat_ssl || g_cat_pkg || g_cat_secure || g_cat_debugger || g_cat_signature;
 }
 
 // Per-thread pending forced returns: MethodEntered pushes, NonStandardExitPopped consumes. The
 // two run back-to-back on the same thread with no safepoint between, so no locking is needed.
+// For kCallbackReturn the value is computed in MethodEntered and carried here as a JNI global ref
+// (cb_ref, an object result) or cb_void (a void result); BuildValue delivers it and releases the ref.
 struct PendingReturn {
   const ShadowFrame* frame;
   ArtMethod* method;
   const Rule* rule;
+  jobject cb_ref = nullptr;   // kCallbackReturn object result (global ref, released on delivery)
+  bool cb_void = false;       // kCallbackReturn void result
 };
 thread_local std::vector<PendingReturn> t_pending;
 
@@ -427,6 +252,12 @@ jobject InternedFor(const char* key) {
   auto it = g_interned.find(key);
   return it == g_interned.end() ? nullptr : it->second;
 }
+
+// ---------------------------------------------------------------------------
+// General frame inspection / modification
+// ---------------------------------------------------------------------------
+// Rule-agnostic primitives for reading and writing interpreter shadow-frame state (arguments, the
+// receiver's fields). The rule action scripts (scanner_hooks_scripts.inc) build on these.
 
 // Reads the String argument at the given logical position of an interpreter frame, or null.
 ObjPtr<mirror::String> GetStringArg(ShadowFrame* sf, ArtMethod* method, int logical_pos)
@@ -473,7 +304,7 @@ ObjPtr<mirror::String> GetThisStringField(ShadowFrame* sf, ArtMethod* method, co
   if (self_obj == nullptr) {
     return nullptr;
   }
-  ArtField* field = self_obj->GetClass()->FindDeclaredInstanceField(field_name, "Ljava/lang/String;");
+  ArtField* field = self_obj->GetClass()->FindDeclaredInstanceField(field_name, kStringDescriptor);
   if (field == nullptr) {
     return nullptr;
   }
@@ -534,7 +365,7 @@ int GetArgSlot(ArtMethod* method, int logical_pos) REQUIRES_SHARED(Locks::mutato
 // Sets this.<field_name> (a String instance field) to `value` on `obj`, if the field exists.
 void SetStringField(mirror::Object* obj, const char* field_name, ObjPtr<mirror::String> value)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  ArtField* field = obj->GetClass()->FindDeclaredInstanceField(field_name, "Ljava/lang/String;");
+  ArtField* field = obj->GetClass()->FindDeclaredInstanceField(field_name, kStringDescriptor);
   if (field != nullptr) {
     field->SetObject<false>(obj, value);
   }
@@ -542,7 +373,7 @@ void SetStringField(mirror::Object* obj, const char* field_name, ObjPtr<mirror::
 
 ObjPtr<mirror::String> GetStringFieldOf(mirror::Object* obj, const char* field_name)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  ArtField* field = obj->GetClass()->FindDeclaredInstanceField(field_name, "Ljava/lang/String;");
+  ArtField* field = obj->GetClass()->FindDeclaredInstanceField(field_name, kStringDescriptor);
   if (field == nullptr) {
     return nullptr;
   }
@@ -550,57 +381,10 @@ ObjPtr<mirror::String> GetStringFieldOf(mirror::Object* obj, const char* field_n
   return (value == nullptr) ? ObjPtr<mirror::String>(nullptr) : value->AsString();
 }
 
-// Runs a kCallbackMutate rule. Mutates arg/this state in place; the method then runs normally.
-void RunMutateCallback(Thread* self, const Rule* rule, ShadowFrame* sf, ArtMethod* method)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  switch (rule->int_value) {
-    case kCbBindServiceSpoof: {
-      // bindService(Intent, ServiceConnection, int): redirect the target package when the Intent's
-      // action is a Play Integrity / SafetyNet bind.
-      mirror::Object* intent = GetArgObject(sf, method, 0);
-      if (intent == nullptr) {
-        return;
-      }
-      ObjPtr<mirror::String> action = GetStringFieldOf(intent, "mAction");
-      if (action == nullptr) {
-        return;
-      }
-      bool matched = false;
-      for (const char* a : kIntegrityBindActions) {
-        if (action->Equals(a)) {
-          matched = true;
-          break;
-        }
-      }
-      if (!matched) {
-        return;
-      }
-      ObjPtr<mirror::String> fake = mirror::String::AllocFromModifiedUtf8(self, "com.fake_market");
-      if (fake != nullptr) {
-        SetStringField(intent, "mPackage", fake);
-      }
-      break;
-    }
-    case kCbClearSecureFlag: {
-      // Window.addFlags(int) / setFlags(int flags, int mask): clear FLAG_SECURE from the int args in
-      // place so the secure flag can never be applied. addFlags has one int (arg 0); setFlags has two
-      // (args 0 and 1). GetArgSlot returns -1 for an absent arg, so the second clear is a no-op for
-      // addFlags.
-      static constexpr int32_t kFlagSecure = 0x2000;  // WindowManager.LayoutParams.FLAG_SECURE
-      int slot0 = GetArgSlot(method, 0);
-      if (slot0 >= 0) {
-        sf->SetVReg(static_cast<size_t>(slot0), sf->GetVReg(static_cast<size_t>(slot0)) & ~kFlagSecure);
-      }
-      int slot1 = GetArgSlot(method, 1);
-      if (slot1 >= 0) {
-        sf->SetVReg(static_cast<size_t>(slot1), sf->GetVReg(static_cast<size_t>(slot1)) & ~kFlagSecure);
-      }
-      break;
-    }
-    default:
-      break;
-  }
-}
+// Rule action "scripts" (kCallbackMutate bodies) live in a separate file, grouped with the rules
+// rather than with the general frame-inspection helpers above. Included here, after those helpers it
+// depends on and before the listener that dispatches to it.
+#include "scanner_hooks_scripts.inc"
 
 bool InArgValues(const Rule* rule, ObjPtr<mirror::String> s) REQUIRES_SHARED(Locks::mutator_lock_) {
   if (s == nullptr) {
@@ -631,8 +415,7 @@ bool ArgMatches(const Rule* rule, ShadowFrame* sf, ArtMethod* method)
 // Debug.waitForDebugger(), which polls Debug.isDebuggerConnected() until the debugger has attached.
 // Forcing that poll to false would hang the process at startup before any app code runs, so this
 // caller is exempted and sees the real value; every other caller (the app's own RASP checks) still
-// gets the spoofed value. This mirrors the JDI pipeline, which only spoofed app-side calls made
-// after the debugger had already attached.
+// gets the spoofed value — i.e. only app-side calls made after a debugger has attached are spoofed.
 bool CalledFromWaitForDebugger(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) {
   if (g_wait_for_debugger == nullptr) {
     return false;  // not resolved -> cannot be a waitForDebugger call; spoof normally
@@ -709,11 +492,27 @@ class ScannerListener final : public instrumentation::InstrumentationListener {
     if (g_verbose) {
       LOG(INFO) << "scanner: rule fired " << matched->class_descriptor << "." << matched->member_name;
     }
+    if (matched->action == ActionKind::kCallbackMutateReturn) {
+      return;  // applied on MethodExited (mutates the returned object), not on entry
+    }
     if (matched->action == ActionKind::kCallbackMutate) {
       t_in_hook = true;
       RunMutateCallback(thread, matched, sf, method);
       t_in_hook = false;
-      return;  // method runs normally with the mutated state
+      return;  // method runs normally with the mutated (or stepped-out) state
+    }
+    if (matched->action == ActionKind::kCallbackReturn) {
+      // Compute the return value natively (may invoke managed code). On any failure we do NOT
+      // force-return, so the method runs unmodified (fail-safe).
+      t_in_hook = true;
+      CallbackReturnResult res = RunCallbackReturn(thread, matched, sf, method);
+      t_in_hook = false;
+      if (!res.ok) {
+        return;
+      }
+      t_pending.push_back({sf, method, matched, res.ref, res.is_void});
+      sf->SetForcePopFrame(true);
+      return;
     }
     t_pending.push_back({sf, method, matched});
     sf->SetForcePopFrame(true);
@@ -723,17 +522,55 @@ class ScannerListener final : public instrumentation::InstrumentationListener {
       override REQUIRES_SHARED(Locks::mutator_lock_) {
     for (auto it = t_pending.begin(); it != t_pending.end(); ++it) {
       if (it->frame == &frame && it->method == frame.GetMethod()) {
-        BuildValue(thread, it->rule, &return_value);
+        if (it->rule->action == ActionKind::kCallbackReturn) {
+          // Value was computed in MethodEntered and carried as a global ref / void marker.
+          if (it->cb_void) {
+            // void: leave return_value default.
+          } else {
+            return_value.SetL(it->cb_ref == nullptr ? nullptr : thread->DecodeJObject(it->cb_ref));
+          }
+          if (it->cb_ref != nullptr) {
+            Runtime::Current()->GetJavaVM()->DeleteGlobalRef(thread, it->cb_ref);
+          }
+        } else {
+          BuildValue(thread, it->rule, &return_value);
+        }
         t_pending.erase(it);
         return;
       }
     }
   }
 
-  // Remaining InstrumentationListener pure-virtuals: no-ops.
-  void MethodExited(Thread*, ArtMethod*, instrumentation::OptionalFrame,
-                    MutableHandle<mirror::Object>&) override
-      REQUIRES_SHARED(Locks::mutator_lock_) {}
+  // Object-returning method exit: apply kCallbackMutateReturn rules, which mutate the returned
+  // object in place (e.g. clear ApplicationInfo.FLAG_DEBUGGABLE). A no-op unless a mutate-return rule
+  // targets this method. Never force-returns; the real return value is kept, only mutated.
+  void MethodExited(Thread* thread, ArtMethod* method, instrumentation::OptionalFrame,
+                    MutableHandle<mirror::Object>& return_value) override
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    if (t_in_hook || return_value == nullptr) {
+      return;
+    }
+    const Rule* matched = nullptr;
+    {
+      std::lock_guard<std::mutex> guard(g_lock);
+      auto it = g_method_rules.find(method);
+      if (it == g_method_rules.end()) {
+        return;
+      }
+      for (const Rule* rule : it->second) {
+        if (rule->action == ActionKind::kCallbackMutateReturn && CategoryEnabled(rule->category)) {
+          matched = rule;
+          break;
+        }
+      }
+    }
+    if (matched == nullptr) {
+      return;
+    }
+    t_in_hook = true;
+    RunMutateReturnCallback(thread, matched, return_value.Get());
+    t_in_hook = false;
+  }
   void MethodExited(Thread*, ArtMethod*, instrumentation::OptionalFrame, JValue&) override
       REQUIRES_SHARED(Locks::mutator_lock_) {}
   void MethodUnwind(Thread*, ArtMethod*, uint32_t) override
@@ -780,9 +617,14 @@ class ScannerListener final : public instrumentation::InstrumentationListener {
       case ActionKind::kFieldSetBool:
       case ActionKind::kFieldSetString:
       case ActionKind::kCallbackMutate:
-        // These actions are applied at class-prepare or in MethodEntered and never reach the
-        // force-return path.
+      case ActionKind::kCallbackMutateReturn:
+        // Applied at class-prepare / MethodEntered / MethodExited; never a const force-return.
         LOG(FATAL) << "scanner: non-return action reached method return path";
+        UNREACHABLE();
+      case ActionKind::kCallbackReturn:
+        // Delivered directly in NonStandardExitPopped from the precomputed global ref; the value is
+        // never rebuilt here.
+        LOG(FATAL) << "scanner: kCallbackReturn reached BuildValue";
         UNREACHABLE();
     }
   }
@@ -973,12 +815,12 @@ void ResolveEmptyList(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) {
     return;
   }
   ObjPtr<mirror::Class> klass =
-      Runtime::Current()->GetClassLinker()->FindSystemClass(self, "Ljava/util/Collections;");
+      Runtime::Current()->GetClassLinker()->FindSystemClass(self, kCollectionsDescriptor);
   if (klass == nullptr) {
     self->ClearException();
     return;
   }
-  ArtField* field = klass->FindDeclaredStaticField("EMPTY_LIST", "Ljava/util/List;");
+  ArtField* field = klass->FindDeclaredStaticField(kEmptyListFieldName, kListDescriptor);
   if (field == nullptr) {
     return;
   }
@@ -992,12 +834,13 @@ void ResolveEmptyList(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) {
 // its calls by pointer. Safe to fail (gate then simply never exempts).
 void ResolveWaitForDebugger(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) {
   ObjPtr<mirror::Class> klass =
-      Runtime::Current()->GetClassLinker()->FindSystemClass(self, "Landroid/os/Debug;");
+      Runtime::Current()->GetClassLinker()->FindSystemClass(self, kDebugDescriptor);
   if (klass == nullptr) {
     self->ClearException();
     return;
   }
-  g_wait_for_debugger = klass->FindClassMethod("waitForDebugger", "()V", kRuntimePointerSize);
+  g_wait_for_debugger =
+      klass->FindClassMethod(kWaitForDebuggerName, kVoidNoArgsSignature, kRuntimePointerSize);
 }
 
 // Interns String return constants as JNI global refs. Uses JavaVMExt::AddGlobalRef (which takes an
@@ -1124,7 +967,7 @@ std::string ReadProcName() {
     if (nul != std::string::npos) {
       cmdline.resize(nul);
     }
-    if (!cmdline.empty() && cmdline != "zygote" && cmdline != "zygote64") {
+    if (!cmdline.empty() && cmdline != kZygoteProcName && cmdline != kZygote64ProcName) {
       return cmdline;
     }
   }
@@ -1152,28 +995,31 @@ bool NameMatchesTarget(const std::string& name) {
 void ScannerHooks::Install() {
   // Configuration comes from system properties set by the scanner during device setup. If no target
   // package is configured, or no rule category is enabled, do nothing (zero overhead).
-  g_target_package = android::base::GetProperty("dalvik.vm.scanner-target", "");
-  g_cat_rasp = android::base::GetBoolProperty("dalvik.vm.scanner-rasp", false);
-  g_cat_ssl = android::base::GetBoolProperty("dalvik.vm.scanner-ssl", false);
-  g_cat_pkg = android::base::GetBoolProperty("dalvik.vm.scanner-package", false);
-  g_cat_secure = android::base::GetBoolProperty("dalvik.vm.scanner-secure-flag", false);
-  g_cat_debugger = android::base::GetBoolProperty("dalvik.vm.scanner-debugger", false);
-  g_verbose = android::base::GetBoolProperty("dalvik.vm.scanner-verbose", false);
+  g_target_package = android::base::GetProperty(kPropTarget, "");
+  g_cat_rasp = android::base::GetBoolProperty(kPropRasp, false);
+  g_cat_ssl = android::base::GetBoolProperty(kPropSsl, false);
+  g_cat_pkg = android::base::GetBoolProperty(kPropPackage, false);
+  g_cat_secure = android::base::GetBoolProperty(kPropSecureFlag, false);
+  g_cat_debugger = android::base::GetBoolProperty(kPropDebugger, false);
+  g_cat_signature = android::base::GetBoolProperty(kPropSignature, false);
+  g_verbose = android::base::GetBoolProperty(kPropVerbose, false);
+  // Device API level, used by the signature-spoof rules to pick version-specific object shapes.
+  g_sdk_int = android::base::GetIntProperty("ro.build.version.sdk", 0);
   if (g_target_package.empty() || !AnyCategoryEnabled()) {
     return;
   }
 
-  // The scanner makes the target app wait for the debugger and drives it over JDI, which suppresses
-  // the normal AppInfoCallback path. So gate on the process name available right here at post-fork
-  // (from /proc/self/cmdline), and install immediately if this is the target. Keep the
-  // AppInfoCallback only as a fallback for launch flows where the name isn't set this early.
+  // When the target app is launched waiting for a debugger, the normal AppInfoCallback path can be
+  // suppressed. So gate on the process name available right here at post-fork (from
+  // /proc/self/cmdline), and install immediately if this is the target. Keep the AppInfoCallback only
+  // as a fallback for launch flows where the name isn't set this early.
   Thread* self = Thread::Current();
   std::string proc_name = ReadProcName();
   bool is_target = NameMatchesTarget(proc_name);
   LOG(INFO) << "scanner: Install procName='" << proc_name << "' target='" << g_target_package
             << "' match=" << is_target << " (rasp=" << g_cat_rasp << " ssl=" << g_cat_ssl
             << " pkg=" << g_cat_pkg << " secure=" << g_cat_secure
-            << " debugger=" << g_cat_debugger << ")";
+            << " debugger=" << g_cat_debugger << " signature=" << g_cat_signature << ")";
 
   ScopedObjectAccess soa(self);
   if (is_target) {
