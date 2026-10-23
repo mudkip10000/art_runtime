@@ -23,6 +23,16 @@ const char* const kPropBuildType[] = {"ro.build.type"};
 const char* const kPropBootState[] = {"ro.boot.verifiedbootstate"};
 const char* const kPropBuildFingerprint[] = {"ro.build.fingerprint"};
 const char* const kPropBuildTags[] = {"ro.build.tags"};
+// Spoofed values for the property probes above, shared by the SystemProperties.get rule rows and
+// the ProcessBuilder getprop-spoof in scanner_hooks_scripts.inc (single source for both paths).
+const char* const kFakeSecureValue = "1";
+const char* const kFakeDebuggableValue = "0";
+const char* const kFakeBuildType = "user";
+const char* const kFakeBuildTags = "release-keys";
+const char* const kFakeVerifiedBootState = "green";
+const char* const kFakeBrand = "google";
+const char* const kFakeModel = "pixel";
+const char* const kFakeHardware = "exynos2100";
 const char* const kPropEmulator[] = {
     "init.svc.qemu-adb-keys", "init.svc.qemu-adb-setup", "init.svc.qemu-device-state",
     "init.svc.qemu-props", "init.svc_debug_pid.qemu-adb-keys",
@@ -48,10 +58,9 @@ const char* const kIntegrityBindActions[] = {
     "com.google.android.play.core.integrityservice.BIND_INTEGRITY_SERVICE",
     "com.google.android.gms.safetynet.service.START"};
 // android.content.Intent internals the bindService redirect reads (mAction) and rewrites
-// (mPackage), and the package it repoints the bind at. "com.fake_market" is the scanner's decoy
-// helper app (installed during device setup): it exposes stub integrity/SafetyNet services, so the
-// bind resolves to the decoy and returns benign results instead of hitting the real GMS/Play
-// service.
+// (mPackage), and the package it repoints the bind at. "com.fake_market" is a decoy helper app
+// that exposes stub integrity/SafetyNet services, so the bind resolves to it and returns benign
+// results instead of hitting the real GMS/Play service.
 constexpr const char* kIntentActionField = "mAction";
 constexpr const char* kIntentPackageField = "mPackage";
 constexpr const char* kBindServiceSpoofPackage = "com.fake_market";
@@ -75,7 +84,7 @@ const char* const kRootPaths[] = {
 const char kFingerprint[] =
     "google/exynos2100/pixel:14/google/google:user/release-keys";
 
-// java.util.Collections.EMPTY_LIST — the object kConstEmptyList rules force-return (resolved once
+// java.util.Collections.EMPTY_LIST - the object kConstEmptyList rules force-return (resolved once
 // at install by ResolveEmptyList).
 constexpr const char* kCollectionsDescriptor = "Ljava/util/Collections;";
 constexpr const char* kEmptyListFieldName = "EMPTY_LIST";
@@ -159,19 +168,18 @@ const size_t kGoogleCertDerLen = sizeof(kGoogleCertDer);
 // Google package names whose getPackageInfo query returns the fabricated Google PackageInfo.
 const char* const kGooglePackages[] = {"com.android.vending", "com.google.android.gms"};
 
-// The rule table. A method-name pattern that matches several names is expanded to one row per
-// name. A row with is_field set spoofs a static field; otherwise it intercepts a method.
+// The rule table. Member names match exactly; add one row per name or overload. A row with
+// is_field set spoofs a static field; otherwise it intercepts a method.
 #define RASP RuleCategory::kRaspBypass
 #define SSLB RuleCategory::kSslBypass
 #define PKG RuleCategory::kPackageManipulation
 #define DBG RuleCategory::kDebuggerBypass
 #define SEC RuleCategory::kSecureFlagBypass
-#define SIG RuleCategory::kSignatureSpoof
 const Rule kRules[] = {
     // android.os.Debug
-    // Debugger-detection rules live in their own category: they are spoofed only once a JDWP
-    // debugger has actually attached (see DebuggerAttached), so they never answer the framework's
-    // wait-for-debugger startup path with a premature "not connected".
+    // Debugger-detection rules live in their own category. They return "not connected", except on
+    // the stack of Debug.waitForDebugger()'s startup poll (see CalledFromWaitForDebugger in
+    // scanner_hooks.cc), so a process started waiting for a debugger does not hang at startup.
     {DBG, "Landroid/os/Debug;", "isDebuggerConnected", false, kNoArg, nullptr, 0,
      ActionKind::kConstBool, false, 0, nullptr},
     {DBG, "Landroid/os/Debug;", "waitingForDebugger", false, kNoArg, nullptr, 0,
@@ -215,29 +223,29 @@ const Rule kRules[] = {
     {RASP, "Landroid/os/SystemProperties;", "getInt", false, 0, ARR(kPropSkipWarn),
      ActionKind::kConstInt, false, 100000000, nullptr},
     {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropBuildType),
-     ActionKind::kConstString, false, 0, "user"},
+     ActionKind::kConstString, false, 0, kFakeBuildType},
     {RASP, "Landroid/os/SystemProperties;", "getInt", false, 0, ARR(kPropDebuggableQemu),
      ActionKind::kConstInt, false, 0, nullptr},
     {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropDebuggableKernelQemu),
-     ActionKind::kConstString, false, 0, "0"},
+     ActionKind::kConstString, false, 0, kFakeDebuggableValue},
     {RASP, "Landroid/os/SystemProperties;", "getBoolean", false, 0, ARR(kPropSecureBoot),
      ActionKind::kConstBool, true, 0, nullptr},
     {RASP, "Landroid/os/SystemProperties;", "getInt", false, 0, ARR(kPropSecureBoot),
      ActionKind::kConstInt, false, 1, nullptr},
     {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropSecureBoot),
-     ActionKind::kConstString, false, 0, "1"},
+     ActionKind::kConstString, false, 0, kFakeSecureValue},
     {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropBootState),
-     ActionKind::kConstString, false, 0, "green"},
+     ActionKind::kConstString, false, 0, kFakeVerifiedBootState},
     {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropBrand),
-     ActionKind::kConstString, false, 0, "google"},
+     ActionKind::kConstString, false, 0, kFakeBrand},
     {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropHardware),
-     ActionKind::kConstString, false, 0, "exynos2100"},
+     ActionKind::kConstString, false, 0, kFakeHardware},
     {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropBuildFingerprint),
      ActionKind::kConstString, false, 0, kFingerprint},
     {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropDevice),
-     ActionKind::kConstString, false, 0, "pixel"},
+     ActionKind::kConstString, false, 0, kFakeModel},
     {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropBuildTags),
-     ActionKind::kConstString, false, 0, "release-keys"},
+     ActionKind::kConstString, false, 0, kFakeBuildTags},
     {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropEmulator),
      ActionKind::kConstNull, false, 0, nullptr},
 
@@ -329,7 +337,7 @@ const Rule kRules[] = {
     {SEC, "Landroid/view/Window;", "setFlags", false, kNoArg, nullptr, 0,
      ActionKind::kCallbackMutate, false, kCbClearSecureFlag, nullptr},
 
-    // --- tier-3: managed-invoke / object-building / cross-frame rules -----------------------------
+    // --- callback-based rules: managed invoke, object building, cross-frame state ----------------
     // Fields after string_value: this_field, match_subtypes, return_shorty.
 
     // SSL: X509TrustManager.checkServerTrusted(List overload) -> Arrays.asList(chain). return_shorty
@@ -346,11 +354,11 @@ const Rule kRules[] = {
     {SSLB, "Ljavax/net/ssl/SSLPeerUnverifiedException;", "<init>", false, kNoArg, nullptr, 0,
      ActionKind::kCallbackMutate, false, kCbSslPeerUnverifiedStepOut, nullptr},
 
-    // SIGNATURE: getPackageInfo("com.android.vending"/gms, ...) -> fabricated Google PackageInfo
-    // built off the embedded Google signing cert (no app cert needed).
-    {SIG, "Landroid/content/pm/PackageManager;", "getPackageInfo", false, 0, ARR(kGooglePackages),
+    // getPackageInfo("com.android.vending"/gms, ...) -> fabricated Google PackageInfo built off
+    // the embedded Google signing cert (no app cert needed).
+    {PKG, "Landroid/content/pm/PackageManager;", "getPackageInfo", false, 0, ARR(kGooglePackages),
      ActionKind::kCallbackReturn, false, kCbFakeGooglePackageInfo, nullptr, nullptr, true, 0},
-    {SIG, "Landroid/content/pm/IPackageManager;", "getPackageInfo", false, 0, ARR(kGooglePackages),
+    {PKG, "Landroid/content/pm/IPackageManager;", "getPackageInfo", false, 0, ARR(kGooglePackages),
      ActionKind::kCallbackReturn, false, kCbFakeGooglePackageInfo, nullptr, nullptr, true, 0},
 
     // RASP: ApplicationInfo.flags debuggable bit. The field read cannot be intercepted, so clear
@@ -361,11 +369,21 @@ const Rule kRules[] = {
     {RASP, "Landroid/content/pm/IPackageManager;", "getApplicationInfo", false, kNoArg, nullptr, 0,
      ActionKind::kCallbackMutateReturn, false, kCbClearApplicationInfoDebuggable, nullptr, nullptr,
      true, 0},
+
+    // RASP: java.lang.ProcessBuilder.start(). Shell-based probes exec commands (which su / getprop /
+    // su); rewrite the receiver's command list so they yield benign faked output, then let start()
+    // run (mutate-and-proceed).
+    {RASP, "Ljava/lang/ProcessBuilder;", "start", false, kNoArg, nullptr, 0,
+     ActionKind::kCallbackMutate, false, kCbProcessBuilderSpoofCommand, nullptr},
+
+    // RASP: java.util.jar.JarFile.maybeInstantiateVerifier(). Disable JAR/APK signature verification
+    // on the receiver (verify=false, jv=null) and skip the method body (force-return void).
+    {RASP, "Ljava/util/jar/JarFile;", "maybeInstantiateVerifier", false, kNoArg, nullptr, 0,
+     ActionKind::kCallbackReturn, false, kCbJarFileSkipVerifier, nullptr, nullptr, false, 0},
 };
 #undef RASP
 #undef SSLB
 #undef PKG
 #undef DBG
 #undef SEC
-#undef SIG
 #undef ARR

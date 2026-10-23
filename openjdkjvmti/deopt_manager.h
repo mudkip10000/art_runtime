@@ -35,6 +35,7 @@
 #include <atomic>
 #include <iosfwd>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "base/mutex.h"
 #include "runtime_callbacks.h"
@@ -177,6 +178,12 @@ class DeoptManager {
   // A map from methods to the number of breakpoints in them from all envs.
   std::unordered_map<art::ArtMethod*, uint32_t> breakpoint_status_
       GUARDED_BY(breakpoint_status_lock_);
+
+  // Methods already deoptimized by a non-JVMTI owner (the in-process scanner hooks) when a
+  // breakpoint was placed on them, so DeoptManager did not deoptimize them and must not
+  // undeoptimize them on breakpoint removal. Only accessed under ScopedDeoptimizationContext, which
+  // serializes all deopt work (SuspendAll + performing_deoptimization_), so it needs no lock.
+  std::unordered_set<art::ArtMethod*> externally_deoptimized_;
 
   // The MethodInspectionCallback we use to tell the runtime if we care about particular methods.
   JvmtiMethodInspectionCallback inspection_callback_;

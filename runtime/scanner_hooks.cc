@@ -58,7 +58,7 @@ namespace {
 // ---------------------------------------------------------------------------
 // Plumbing used by the engine helpers below regardless of any particular rule. Constants tied to a
 // specific rule's behaviour (spoofed values, the fields a mutate rule rewrites, an action's target
-// object) live next to the rules in scanner_hooks_rules.inc instead.
+// object) live with the rules in scanner_hooks_rules.inc and scanner_hooks_scripts.inc instead.
 
 // java.lang.String type descriptor, used to resolve String fields by (name, type).
 constexpr const char* kStringDescriptor = "Ljava/lang/String;";
@@ -72,14 +72,13 @@ constexpr const char* kVoidNoArgsSignature = "()V";
 constexpr const char* kZygoteProcName = "zygote";
 constexpr const char* kZygote64ProcName = "zygote64";
 
-// System-property keys the scanner sets during device setup to configure these hooks.
+// System-property keys that configure these hooks, read once at install.
 constexpr const char* kPropTarget = "dalvik.vm.scanner-target";
 constexpr const char* kPropRasp = "dalvik.vm.scanner-rasp";
 constexpr const char* kPropSsl = "dalvik.vm.scanner-ssl";
 constexpr const char* kPropPackage = "dalvik.vm.scanner-package";
 constexpr const char* kPropSecureFlag = "dalvik.vm.scanner-secure-flag";
 constexpr const char* kPropDebugger = "dalvik.vm.scanner-debugger";
-constexpr const char* kPropSignature = "dalvik.vm.scanner-signature";
 constexpr const char* kPropVerbose = "dalvik.vm.scanner-verbose";
 
 // ---------------------------------------------------------------------------
@@ -91,11 +90,10 @@ constexpr const char* kPropVerbose = "dalvik.vm.scanner-verbose";
 enum class RuleCategory {
   kRaspBypass,           // root / emulator / tamper detection
   kSslBypass,            // TLS trust and hostname verification
-  kPackageManipulation,  // installer / package identity
+  kPackageManipulation,  // installer / package identity, incl. the fabricated Google-package
+                         // getPackageInfo response (built off an embedded Google signing cert)
   kSecureFlagBypass,     // FLAG_SECURE and screenshot restrictions
   kDebuggerBypass,       // debugger detection; applied only while a JDWP debugger is attached
-  kSignatureSpoof,       // signature / certificate spoofing (the fabricated Google-package
-                         // getPackageInfo response, built off an embedded Google signing cert).
 };
 
 enum class ActionKind {
@@ -124,9 +122,14 @@ enum CallbackId {
   kCbWebViewProceed = 4,          // WebViewClient.onReceivedSslError: handler.proceed(), return void
   kCbFakeGooglePackageInfo = 5,   // getPackageInfo("com.android.vending"/gms): return fake Google PackageInfo
   // kCallbackMutate (mutate state, then run):
-  kCbSslPeerUnverifiedStepOut = 8, // SSLPeerUnverifiedException.<init>: force the void-returning caller to return
+  kCbSslPeerUnverifiedStepOut = 6, // SSLPeerUnverifiedException.<init>: force the void-returning caller to return
+  kCbProcessBuilderSpoofCommand = 7,  // ProcessBuilder.start: rewrite the command list so shell-based
+                                      // RASP probes (which su, getprop <key>, su) get benign faked output
   // kCallbackMutateReturn (mutate returned object on exit):
-  kCbClearApplicationInfoDebuggable = 9,  // ApplicationInfo returned by getApplicationInfo: clear FLAG_DEBUGGABLE
+  kCbClearApplicationInfoDebuggable = 8,  // ApplicationInfo returned by getApplicationInfo: clear FLAG_DEBUGGABLE
+  // kCallbackReturn (mutate state, then force-return void):
+  kCbJarFileSkipVerifier = 9,  // JarFile.maybeInstantiateVerifier: disable JAR signature verification
+                               // (verify=false, jv=null) and skip the method body
 };
 
 struct Rule {
@@ -147,8 +150,8 @@ struct Rule {
   const char* string_value;  // kConstString / kFieldSetString
 
   // Optional `this`-field predicate (instance methods only). If non-null, the rule fires only
-  // when the String value of this.<this_field> equals one of arg_values[0..arg_count). Trailing
-  // field so rows that don't use it default it to nullptr.
+  // when the String value of this.<this_field> equals one of arg_values[0..arg_count). Declared
+  // after string_value so rows that stop earlier default it to nullptr.
   const char* this_field;
 
   // If true, class_descriptor is matched against the prepared class's whole hierarchy
@@ -165,8 +168,8 @@ struct Rule {
 constexpr int kNoArg = -1;
 
 // The rule table and its argument-value arrays are defined in scanner_hooks_rules.inc and textually
-// included here, inside the anonymous namespace, so the table keeps internal linkage and direct use
-// of the enums / Rule struct / kNoArg defined above.
+// included here, inside the anonymous namespace, so the table can use the file-local enums, Rule
+// struct and kNoArg defined above.
 #include "scanner_hooks_rules.inc"
 
 // ---------------------------------------------------------------------------
@@ -174,7 +177,7 @@ constexpr int kNoArg = -1;
 // ---------------------------------------------------------------------------
 
 // Interned String constants, keyed by the table's string_value pointer, held alive as JNI
-// global refs created at Install().
+// global refs created in DoInstall().
 std::unordered_map<const char*, jobject> g_interned;  // GUARDED_BY(g_lock)
 
 // Resolved method -> rules that target it. Written at ClassPrepare, read at MethodEntered.
@@ -182,14 +185,14 @@ std::unordered_map<ArtMethod*, std::vector<const Rule*>> g_method_rules;  // GUA
 std::mutex g_lock;
 
 // Methods to deoptimize, collected during the install-time sweep and deoptimized together under the
-// install suspend-all. (After install, newly-matched methods are deoptimized inline — see
+// install suspend-all. (After install, newly-matched methods are deoptimized inline - see
 // ApplyMethodRule.)
 std::vector<ArtMethod*> g_pending_deopt;  // GUARDED_BY(g_lock)
 
 // Resolved once at install: android.os.Debug.waitForDebugger(). Used by the debugger-detection
 // gate to identify (by pointer, never by descriptor deref) when isDebuggerConnected is being
 // called from the framework's wait-for-debugger poll, so that call is not spoofed.
-ArtMethod* g_wait_for_debugger = nullptr;  // GUARDED_BY(g_lock) for writes; read racily is fine
+ArtMethod* g_wait_for_debugger = nullptr;  // written once in ResolveWaitForDebugger at install, read racily after
 std::atomic<bool> g_installing{false};    // true during the install-time sweep
 
 std::atomic<bool> g_installed{false};
@@ -203,16 +206,15 @@ int g_sdk_int = 0;
 
 // Configuration read from system properties at ScannerHooks::Install(). Hooks are installed only in
 // the process whose package matches g_target_package, and a rule applies only if its category is
-// enabled. The scanner sets these via setprop during device setup, e.g.:
-//   setprop dalvik.vm.scanner-target com.the.app
-//   setprop dalvik.vm.scanner-rasp true ; setprop dalvik.vm.scanner-ssl true
+// enabled. The backing properties, e.g.:
+//   dalvik.vm.scanner-target com.the.app
+//   dalvik.vm.scanner-rasp true ; dalvik.vm.scanner-ssl true
 std::string g_target_package;      // dalvik.vm.scanner-target
 bool g_cat_rasp = false;           // dalvik.vm.scanner-rasp
 bool g_cat_ssl = false;            // dalvik.vm.scanner-ssl
 bool g_cat_pkg = false;            // dalvik.vm.scanner-package
 bool g_cat_secure = false;         // dalvik.vm.scanner-secure-flag
 bool g_cat_debugger = false;       // dalvik.vm.scanner-debugger (deferred until a debugger attaches)
-bool g_cat_signature = false;      // dalvik.vm.scanner-signature (certificate / signature spoofing)
 bool g_verbose = false;            // dalvik.vm.scanner-verbose (log each rule that fires)
 
 bool CategoryEnabled(RuleCategory c) {
@@ -222,17 +224,16 @@ bool CategoryEnabled(RuleCategory c) {
     case RuleCategory::kPackageManipulation: return g_cat_pkg;
     case RuleCategory::kSecureFlagBypass: return g_cat_secure;
     case RuleCategory::kDebuggerBypass: return g_cat_debugger;
-    case RuleCategory::kSignatureSpoof: return g_cat_signature;
   }
   return false;
 }
 
 bool AnyCategoryEnabled() {
-  return g_cat_rasp || g_cat_ssl || g_cat_pkg || g_cat_secure || g_cat_debugger || g_cat_signature;
+  return g_cat_rasp || g_cat_ssl || g_cat_pkg || g_cat_secure || g_cat_debugger;
 }
 
 // Per-thread pending forced returns: MethodEntered pushes, NonStandardExitPopped consumes. The
-// two run back-to-back on the same thread with no safepoint between, so no locking is needed.
+// two run on the same thread, and t_pending is thread_local, so only this thread touches it.
 // For kCallbackReturn the value is computed in MethodEntered and carried here as a JNI global ref
 // (cb_ref, an object result) or cb_void (a void result); BuildValue delivers it and releases the ref.
 struct PendingReturn {
@@ -244,7 +245,7 @@ struct PendingReturn {
 };
 thread_local std::vector<PendingReturn> t_pending;
 
-// Set while a mutate-callback runs, so managed code it triggers doesn't re-enter the hook.
+// Set while a native callback runs, so managed code it triggers doesn't re-enter the hook.
 thread_local bool t_in_hook = false;
 
 jobject InternedFor(const char* key) {
@@ -381,6 +382,20 @@ ObjPtr<mirror::String> GetStringFieldOf(mirror::Object* obj, const char* field_n
   return (value == nullptr) ? ObjPtr<mirror::String>(nullptr) : value->AsString();
 }
 
+// Returns the receiver (this) of an instance-method interpreter frame, or null for a static method /
+// malformed frame. The receiver is the first incoming vreg (num_regs - ins), as in GetThisStringField.
+mirror::Object* GetReceiver(ShadowFrame* sf, ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (method->IsStatic()) {
+    return nullptr;
+  }
+  const uint16_t num_regs = method->DexInstructionData().RegistersSize();
+  const uint16_t ins = method->DexInstructionData().InsSize();
+  if (ins == 0 || ins > num_regs) {
+    return nullptr;
+  }
+  return sf->GetVRegReference(static_cast<int>(num_regs) - static_cast<int>(ins));
+}
+
 // Rule action "scripts" (kCallbackMutate bodies) live in a separate file, grouped with the rules
 // rather than with the general frame-inspection helpers above. Included here, after those helpers it
 // depends on and before the listener that dispatches to it.
@@ -410,40 +425,38 @@ bool ArgMatches(const Rule* rule, ShadowFrame* sf, ArtMethod* method)
 }
 
 // True when android.os.Debug.isDebuggerConnected() is being called from
-// android.os.Debug.waitForDebugger()'s own spin loop. The framework's wait-for-debugger startup
-// gate (triggered by `am set-debug-app -w`, which the scanner uses) calls
-// Debug.waitForDebugger(), which polls Debug.isDebuggerConnected() until the debugger has attached.
-// Forcing that poll to false would hang the process at startup before any app code runs, so this
-// caller is exempted and sees the real value; every other caller (the app's own RASP checks) still
-// gets the spoofed value — i.e. only app-side calls made after a debugger has attached are spoofed.
+// android.os.Debug.waitForDebugger()'s own spin loop. When a process is started waiting for a
+// debugger, the framework's startup gate calls Debug.waitForDebugger(), which polls
+// Debug.isDebuggerConnected() until a debugger has attached. Forcing that poll to false would hang
+// the process at startup before any app code runs, so this caller is exempted and sees the real
+// value; every other caller (the app's own detection checks) gets the spoofed value, whether or
+// not a debugger is actually attached.
 bool CalledFromWaitForDebugger(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) {
   if (g_wait_for_debugger == nullptr) {
     return false;  // not resolved -> cannot be a waitForDebugger call; spoof normally
   }
-  // Find the immediate caller and compare by ArtMethod pointer only. Never call GetName()/
-  // GetDeclaringClassDescriptor() here: on the stack shape where waitForDebugger is reached via
-  // ArtMethod::Invoke, a descriptor deref faulted (null ArtMethod::ptr_sized_fields_ at 0x10).
-  struct CallerVisitor final : public StackVisitor {
-    explicit CallerVisitor(Thread* t)
+  // Scan the WHOLE stack for Debug.waitForDebugger(), not just the immediate caller. The framework's
+  // wait-for-debugger startup gate reaches isDebuggerConnected() from inside waitForDebugger()'s spin
+  // loop, but the frame directly below the hooked method is not reliably waitForDebugger: deoptimizing
+  // isDebuggerConnected leaves a second (quick-stub) frame for the method itself, and transition/
+  // runtime frames can sit between it and the real caller, so an immediate-caller check misses it.
+  // Match by ArtMethod pointer only -- never call GetName()/GetDeclaringClassDescriptor() here: on
+  // some stack shapes a descriptor deref faults (null ArtMethod::ptr_sized_fields_ at 0x10).
+  struct WaitForDebuggerFinder final : public StackVisitor {
+    explicit WaitForDebuggerFinder(Thread* t)
         : StackVisitor(t, nullptr, StackWalkKind::kIncludeInlinedFrames) {}
     bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
-      ArtMethod* m = GetMethod();
-      if (m == nullptr) {
-        return true;  // transition / runtime frame; keep walking
+      if (GetMethod() == g_wait_for_debugger) {
+        found = true;
+        return false;  // found waitForDebugger on the stack; stop walking
       }
-      if (!skipped_self) {
-        skipped_self = true;  // frame 0 is the hooked isDebuggerConnected itself
-        return true;
-      }
-      caller = m;
-      return false;  // frame 1 is the caller; stop
+      return true;  // keep walking
     }
-    bool skipped_self = false;
-    ArtMethod* caller = nullptr;
+    bool found = false;
   };
-  CallerVisitor v(self);
+  WaitForDebuggerFinder v(self);
   v.WalkStack();
-  return v.caller == g_wait_for_debugger;
+  return v.found;
 }
 
 // ---------------------------------------------------------------------------
@@ -479,9 +492,9 @@ class ScannerListener final : public instrumentation::InstrumentationListener {
       return;
     }
     // Debugger-detection rules are deferred past the framework's wait-for-debugger startup gate:
-    // a spoofed "not connected" inside Debug.waitForDebugger() would hang the process before any
-    // app code runs (the scanner launches with `am set-debug-app -w`). Only the app's own calls
-    // get the spoof.
+    // a spoofed "not connected" inside Debug.waitForDebugger() would hang a process that was
+    // started waiting for a debugger before any app code runs. Only the app's own calls get the
+    // spoof.
     if (matched->category == RuleCategory::kDebuggerBypass && CalledFromWaitForDebugger(thread)) {
       if (g_verbose) {
         LOG(INFO) << "scanner: deferred " << matched->class_descriptor << "."
@@ -687,7 +700,7 @@ bool ClassMatchesRule(ObjPtr<mirror::Class> klass, const char* descriptor, const
 }
 
 // Deoptimizes a single method so it runs in the interpreter (where method-entry events fire and the
-// force-pop return substitution works). Mirrors DeoptManager::PerformLimitedDeoptimization: enter a
+// force-pop return substitution works). Same shape as the JVMTI limited-deopt path: enter a
 // suspended state, then a GC-critical section + suspend-all to get the exclusive mutator lock that
 // Instrumentation::Deoptimize requires. Call only when NOT already under a suspend-all.
 void DeoptimizeMethodStandalone(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -696,7 +709,10 @@ void DeoptimizeMethodStandalone(ArtMethod* method) REQUIRES_SHARED(Locks::mutato
   gc::ScopedGCCriticalSection gcs(self, gc::kGcCauseInstrumentation,
                                   gc::kCollectorTypeInstrumentation);
   ScopedSuspendAll ssa("scanner method deopt");
-  Runtime::Current()->GetInstrumentation()->Deoptimize(method);
+  instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
+  if (!instr->IsDeoptimized(method)) {  // guard: Deoptimize aborts if already deoptimized
+    instr->Deoptimize(method);
+  }
 }
 
 void ApplyMethodRule(Handle<mirror::Class> klass, const Rule* rule)
@@ -831,7 +847,8 @@ void ResolveEmptyList(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) {
 }
 
 // Resolves android.os.Debug.waitForDebugger() once so the debugger-detection gate can recognise
-// its calls by pointer. Safe to fail (gate then simply never exempts).
+// its calls by pointer. If this fails the exemption is lost, so a process started in
+// wait-for-debugger mode would hang (its poll of isDebuggerConnected gets the spoofed value).
 void ResolveWaitForDebugger(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) {
   ObjPtr<mirror::Class> klass =
       Runtime::Current()->GetClassLinker()->FindSystemClass(self, kDebugDescriptor);
@@ -844,8 +861,8 @@ void ResolveWaitForDebugger(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) 
 }
 
 // Interns String return constants as JNI global refs. Uses JavaVMExt::AddGlobalRef (which takes an
-// ObjPtr directly) so it needs only a Runnable thread, not a ScopedObjectAccess — it is called from
-// the AppInfoCallback, where the thread is already Runnable.
+// ObjPtr directly) so it needs only a Runnable thread, not a ScopedObjectAccess - it is called from
+// DoInstall, which already runs on a Runnable thread.
 void InternStrings(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) {
   std::lock_guard<std::mutex> guard(g_lock);
   for (const Rule& rule : kRules) {
@@ -863,8 +880,8 @@ void InternStrings(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) {
   }
 }
 
-// Performs the actual install in the target process. Called from the AppInfoCallback once the
-// process package is known, so the thread is already Runnable (REQUIRES_SHARED). Installs once.
+// Performs the actual install in the target process. Called from Install(), OnProcessPackageName()
+// or the AppInfoCallback, each on a Runnable thread (REQUIRES_SHARED). Installs once.
 void DoInstall() REQUIRES_SHARED(Locks::mutator_lock_) {
   bool expected = false;
   if (!g_installed.compare_exchange_strong(expected, true)) {
@@ -877,7 +894,7 @@ void DoInstall() REQUIRES_SHARED(Locks::mutator_lock_) {
   // process-wide; the interpreter DCHECKs Runtime::AreNonStandardExitsEnabled() on that path.
   runtime->SetNonStandardExitsEnabled();
 
-  // Intern String constants / resolve EMPTY_LIST (needs a Runnable thread to allocate — we have it).
+  // Intern String constants / resolve EMPTY_LIST (needs a Runnable thread to allocate - we have it).
   InternStrings(self);
   ResolveEmptyList(self);
   ResolveWaitForDebugger(self);
@@ -890,7 +907,7 @@ void DoInstall() REQUIRES_SHARED(Locks::mutator_lock_) {
   g_installing.store(false);
 
   // Register the class-load callback + the instrumentation listener, and deoptimize exactly the
-  // matched methods (JVMTI-style per-method deopt — NOT the whole process). All require the
+  // matched methods (JVMTI-style per-method deopt - NOT the whole process). All require the
   // exclusive mutator lock, so run them under one suspend-all; drop to kSuspended first since we
   // enter here Runnable.
   size_t deopted = 0;
@@ -906,7 +923,9 @@ void DoInstall() REQUIRES_SHARED(Locks::mutator_lock_) {
                            instrumentation::Instrumentation::kMethodExited);
     std::lock_guard<std::mutex> guard(g_lock);
     for (ArtMethod* m : g_pending_deopt) {
-      instr->Deoptimize(m);
+      if (!instr->IsDeoptimized(m)) {  // guard: Deoptimize aborts if already deoptimized
+        instr->Deoptimize(m);
+      }
     }
     deopted = g_pending_deopt.size();
     g_pending_deopt.clear();
@@ -956,10 +975,9 @@ AppInfoCallback* GetAppInfoCallback() {
   return cb;
 }
 
-// Reads this process's name at post-fork time. The zygote sets argv0 (/proc/self/cmdline) and the
-// thread name (prctl) to the app's process name (== package for the main process) before the
-// post-fork hooks run, so this is available in Install() even though GetProcessPackageName() is not
-// yet set. Prefers the full cmdline; falls back to the (15-char-truncated) thread name.
+// Reads this process's name at post-fork time. /proc/self/cmdline may still read "zygote" this
+// early, so it is used only when it already holds the app name; otherwise fall back to the thread
+// name (prctl, 15-char-truncated), which the zygote sets to the process name before these hooks run.
 std::string ReadProcName() {
   std::string cmdline;
   if (android::base::ReadFileToString("/proc/self/cmdline", &cmdline)) {
@@ -993,17 +1011,16 @@ bool NameMatchesTarget(const std::string& name) {
 }  // namespace
 
 void ScannerHooks::Install() {
-  // Configuration comes from system properties set by the scanner during device setup. If no target
-  // package is configured, or no rule category is enabled, do nothing (zero overhead).
+  // Configuration comes from system properties, read once here at process start. If no target
+  // package is configured, or no rule category is enabled, do nothing (skip all install work).
   g_target_package = android::base::GetProperty(kPropTarget, "");
   g_cat_rasp = android::base::GetBoolProperty(kPropRasp, false);
   g_cat_ssl = android::base::GetBoolProperty(kPropSsl, false);
   g_cat_pkg = android::base::GetBoolProperty(kPropPackage, false);
   g_cat_secure = android::base::GetBoolProperty(kPropSecureFlag, false);
   g_cat_debugger = android::base::GetBoolProperty(kPropDebugger, false);
-  g_cat_signature = android::base::GetBoolProperty(kPropSignature, false);
   g_verbose = android::base::GetBoolProperty(kPropVerbose, false);
-  // Device API level, used by the signature-spoof rules to pick version-specific object shapes.
+  // Device API level, used by the Google-package spoof rules to pick version-specific object shapes.
   g_sdk_int = android::base::GetIntProperty("ro.build.version.sdk", 0);
   if (g_target_package.empty() || !AnyCategoryEnabled()) {
     return;
@@ -1019,7 +1036,7 @@ void ScannerHooks::Install() {
   LOG(INFO) << "scanner: Install procName='" << proc_name << "' target='" << g_target_package
             << "' match=" << is_target << " (rasp=" << g_cat_rasp << " ssl=" << g_cat_ssl
             << " pkg=" << g_cat_pkg << " secure=" << g_cat_secure
-            << " debugger=" << g_cat_debugger << " signature=" << g_cat_signature << ")";
+            << " debugger=" << g_cat_debugger << ")";
 
   ScopedObjectAccess soa(self);
   if (is_target) {

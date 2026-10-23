@@ -410,11 +410,24 @@ void DeoptManager::RemoveDeoptimizeAllMethodsLocked(art::Thread* self) {
 
 void DeoptManager::PerformLimitedDeoptimization(art::Thread* self, art::ArtMethod* method) {
   ScopedDeoptimizationContext sdc(self, this);
-  art::Runtime::Current()->GetInstrumentation()->Deoptimize(method);
+  art::instrumentation::Instrumentation* instr = art::Runtime::Current()->GetInstrumentation();
+  if (instr->IsDeoptimized(method)) {
+    // Already deoptimized by a non-JVMTI owner (the in-process scanner hooks deoptimize their
+    // bypass targets at class-prepare). The deopt registry is not ref-counted, so a second
+    // Deoptimize would abort; record that we don't own this deopt so we never undeoptimize it.
+    externally_deoptimized_.insert(method);
+    return;
+  }
+  instr->Deoptimize(method);
 }
 
 void DeoptManager::PerformLimitedUndeoptimization(art::Thread* self, art::ArtMethod* method) {
   ScopedDeoptimizationContext sdc(self, this);
+  if (externally_deoptimized_.erase(method) != 0) {
+    // A non-JVMTI owner holds this method's deopt; we only tracked a breakpoint on it. Leave it
+    // deoptimized so that owner keeps working.
+    return;
+  }
   art::Runtime::Current()->GetInstrumentation()->Undeoptimize(method);
 }
 

@@ -2,17 +2,17 @@
  * scanner_hooks rule action scripts.
  *
  * Imperative rule actions that read and/or mutate frame state, invoke managed framework code, build
- * framework objects, or compute a return value — anything beyond a constant force-return (which the
+ * framework objects, or compute a return value - anything beyond a constant force-return (which the
  * table and BuildValue handle directly). Kept next to the rule data and apart from the
  * general-purpose frame inspection/modification helpers in scanner_hooks.cc, which these call.
  *
  * Textually included by scanner_hooks.cc from inside its anonymous namespace, AFTER those frame
- * helpers are defined (this file calls GetArgObject / GetStringFieldOf / SetStringField / GetArgSlot)
+ * helpers are defined (e.g. GetReceiver / GetArgObject / GetStringFieldOf / SetStringField / GetArgSlot)
  * and BEFORE the instrumentation listener that dispatches to these functions. Not a standalone
  * translation unit; no include guards; do not #include it anywhere else.
  *
  * FAIL-SAFE INVARIANT: every managed invoke / object build here must degrade to "rule did not fire"
- * on any missing class / field / method, null arg, unexpected object shape, or pending exception —
+ * on any missing class / field / method, null arg, unexpected object shape, or pending exception -
  * never a crash. Each helper null-checks and clears pending exceptions; callbacks that cannot
  * complete return failure so the hooked method simply runs unmodified.
  */
@@ -282,6 +282,163 @@ ObjPtr<mirror::Object> BuildPackageInfo(Thread* self, const char* package_name,
 }
 
 // ---------------------------------------------------------------------------
+// ProcessBuilder / JarFile helpers (command-list rewrite + verifier disable)
+// ---------------------------------------------------------------------------
+constexpr const char* kStringArrayDescriptor = "[Ljava/lang/String;";
+constexpr const char* kListContainsName = "contains";
+constexpr const char* kListContainsSig = "(Ljava/lang/Object;)Z";
+constexpr const char* kListSizeName = "size";
+constexpr const char* kListSizeSig = "()I";
+constexpr const char* kListGetName = "get";
+constexpr const char* kListGetSig = "(I)Ljava/lang/Object;";
+constexpr const char* kProcessBuilderCommandField = "command";  // List<String>
+constexpr const char* kJarFileVerifyField = "verify";           // boolean gate
+constexpr const char* kJarFileVerifierField = "jv";             // JarVerifier reference
+// The faked stdout of a bare `getprop` dump (one `key=value` per line).
+constexpr const char* kFakeGetpropOutput =
+    "ro.adb.secure=1\n"
+    "ro.secure=1\n"
+    "ro.boot.flash.locked=1\n"
+    "ro.debuggable=0\n"
+    "ro.boot.qemu=0\n"
+    "ro.build.type=user\n"
+    "ro.build.tags=release-keys\n"
+    "ro.boot.verifiedbootstate=green\n"
+    "ro.product.brand=google\n"
+    "ro.product.manufacturer=google\n"
+    "ro.product.device=pixel\n"
+    "ro.product.model=pixel\n"
+    "ro.product.name=exynos2100\n"
+    "ro.hardware=exynos2100\n"
+    "ro.build.fingerprint=google/exynos2100/pixel:14/google/google:user/release-keys\n";
+
+// ProcessBuilder.start() command-spoof tokens: the shell probes RASP code runs (which / su /
+// getprop) and the fake `su` name swapped in. The getprop property keys and their faked values are
+// reused from scanner_hooks_rules.inc (kProp* arrays, kFake* constants) by the branch below.
+constexpr const char* kCmdEcho = "echo";
+constexpr const char* kCmdWhich = "which";
+constexpr const char* kCmdWhichPath = "/system/bin/which";
+constexpr const char* kCmdGetprop = "getprop";
+constexpr const char* kCmdSu = "su";
+constexpr const char* kCmdSuPath = "/system/xbin/su";
+constexpr const char* kFakeSu = "fakesu";
+
+// Finds an instance field by name (any type), searching the class and its superclasses, or null.
+// Used where the field type is version-dependent (JarFile.jv) or simply unambiguous by name.
+// Finds a non-static field by (name, declared type), searching the class and its superclasses.
+// The type match matters: callers write via SetBoolean/SetObject, whose own type check is a DCHECK
+// (compiled out in release), so a same-named field of the wrong type would otherwise cause an
+// out-of-type raw write. A mismatch is treated as "not found" (fail-safe: the rule then no-ops).
+ArtField* FindInstanceFieldByName(ObjPtr<mirror::Class> klass, const char* name,
+                                  Primitive::Type expected)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  for (ObjPtr<mirror::Class> c = klass; c != nullptr; c = c->GetSuperClass()) {
+    // ART keeps static and instance fields in one GetFields() array; skip statics.
+    for (ArtField& f : c->GetFields()) {
+      if (!f.IsStatic() && f.GetTypeAsPrimitiveType() == expected &&
+          strcmp(f.GetName(), name) == 0) {
+        return &f;
+      }
+    }
+  }
+  return nullptr;
+}
+
+// List.contains(s): invokes the receiver's contains(Object) with a fresh String. Fail-safe false.
+bool ListContains(Thread* self, Handle<mirror::Object> list, const char* s)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  ArtMethod* contains =
+      list->GetClass()->FindClassMethod(kListContainsName, kListContainsSig, kRuntimePointerSize);
+  if (contains == nullptr) {
+    return false;
+  }
+  StackHandleScope<1> hs(self);
+  Handle<mirror::String> str(hs.NewHandle(mirror::String::AllocFromModifiedUtf8(self, s)));
+  if (str == nullptr) {
+    self->ClearException();
+    return false;
+  }
+  uint32_t args[2] = {RefSlot(list.Get()), RefSlot(str.Get())};
+  JValue r;
+  if (!InvokeManaged(self, contains, args, sizeof(args), "ZL", &r)) {
+    return false;
+  }
+  return r.GetZ() != 0;
+}
+
+// True if the list contains any key of a rules.inc kProp* array, so a getprop branch matches the
+// same keys the SystemProperties.get rules use without a per-key ListContains chain. N is deduced.
+template <size_t N>
+bool ListContainsAnyOf(Thread* self, Handle<mirror::Object> list, const char* const (&keys)[N])
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  for (size_t i = 0; i < N; ++i) {
+    if (ListContains(self, list, keys[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// True iff the list has exactly one element and it is the String `s` (size()==1 && get(0).equals(s)).
+bool ListEqualsSingleton(Thread* self, Handle<mirror::Object> list, const char* s)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  ObjPtr<mirror::Class> cls = list->GetClass();
+  ArtMethod* size_m = cls->FindClassMethod(kListSizeName, kListSizeSig, kRuntimePointerSize);
+  ArtMethod* get_m = cls->FindClassMethod(kListGetName, kListGetSig, kRuntimePointerSize);
+  if (size_m == nullptr || get_m == nullptr) {
+    return false;
+  }
+  uint32_t sargs[1] = {RefSlot(list.Get())};
+  JValue sres;
+  if (!InvokeManaged(self, size_m, sargs, sizeof(sargs), "I", &sres) || sres.GetI() != 1) {
+    return false;
+  }
+  uint32_t gargs[2] = {RefSlot(list.Get()), 0u};
+  JValue gres;
+  if (!InvokeManaged(self, get_m, gargs, sizeof(gargs), "LI", &gres)) {
+    return false;
+  }
+  ObjPtr<mirror::Object> e0 = gres.GetL();
+  return e0 != nullptr && e0->IsString() && e0->AsString()->Equals(s);
+}
+
+// Builds a java.util.List<String> of the given literals via Arrays.asList(new String[]{...}), or null.
+ObjPtr<mirror::Object> MakeStringList(Thread* self, const std::vector<const char*>& items)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  StackHandleScope<3> hs(self);
+  Handle<mirror::Class> arrays(hs.NewHandle(ResolveSystemClass(self, kArraysDescriptor)));
+  if (arrays == nullptr) {
+    return nullptr;
+  }
+  Handle<mirror::Class> str_arr(hs.NewHandle(ResolveSystemClass(self, kStringArrayDescriptor)));
+  if (str_arr == nullptr) {
+    return nullptr;
+  }
+  Handle<mirror::ObjectArray<mirror::Object>> arr(hs.NewHandle(
+      mirror::ObjectArray<mirror::Object>::Alloc(self, str_arr.Get(),
+                                                 static_cast<int32_t>(items.size()))));
+  if (arr == nullptr) {
+    self->ClearException();
+    return nullptr;
+  }
+  for (size_t i = 0; i < items.size(); ++i) {
+    ObjPtr<mirror::String> s = mirror::String::AllocFromModifiedUtf8(self, items[i]);
+    if (s == nullptr) {
+      self->ClearException();
+      return nullptr;
+    }
+    arr->Set(static_cast<int32_t>(i), s);  // stored immediately; no alloc between build and Set
+  }
+  ArtMethod* as_list = arrays->FindClassMethod(kAsListName, kAsListSig, kRuntimePointerSize);
+  uint32_t args[1] = {RefSlot(arr.Get())};
+  JValue result;
+  if (!InvokeManaged(self, as_list, args, sizeof(args), "LL", &result)) {
+    return nullptr;
+  }
+  return result.GetL();
+}
+
+// ---------------------------------------------------------------------------
 // kCallbackReturn: compute a return value (may invoke managed code)
 // ---------------------------------------------------------------------------
 
@@ -366,6 +523,30 @@ CallbackReturnResult RunCallbackReturn(Thread* self, const Rule* rule, ShadowFra
       }
       return MakeObjectResult(self, pkg);
     }
+    case kCbJarFileSkipVerifier: {
+      // java.util.jar.JarFile.maybeInstantiateVerifier(): disable JAR/APK signature verification by
+      // clearing the verify gate (and the verifier reference, if present) on the receiver, then skip
+      // the method body (force-return void). If the verify field is absent we fail-safe: the method
+      // runs unmodified. jv's type is version-dependent, so it is matched by name.
+      mirror::Object* jf = GetReceiver(sf, method);
+      if (jf == nullptr) {
+        return fail;
+      }
+      ObjPtr<mirror::Class> cls = jf->GetClass();
+      ArtField* f_verify = FindInstanceFieldByName(cls, kJarFileVerifyField, Primitive::kPrimBoolean);
+      if (f_verify == nullptr) {
+        return fail;
+      }
+      f_verify->SetBoolean<false>(jf, 0);
+      ArtField* f_jv = FindInstanceFieldByName(cls, kJarFileVerifierField, Primitive::kPrimNot);
+      if (f_jv != nullptr) {
+        f_jv->SetObject<false>(jf, nullptr);
+      }
+      CallbackReturnResult r;
+      r.ok = true;
+      r.is_void = true;  // maybeInstantiateVerifier returns void
+      return r;
+    }
     default:
       return fail;
   }
@@ -406,7 +587,7 @@ void RunMutateReturnCallback(Thread* self, const Rule* rule, ObjPtr<mirror::Obje
 // (a void-returning check method) rather than failing through one of the hooked verifier methods.
 // We are synchronously inside the ctor's entry hook on our own thread; the caller is parked at the
 // invoke, a safe point. When the caller already runs interpreted we set force-pop on its shadow
-// frame directly — the interpreter honors it before the caller's next instruction (the `throw`), so
+// frame directly - the interpreter honors it before the caller's next instruction (the `throw`), so
 // the caller returns void instead. A COMPILED caller cannot be handled here: materializing its
 // interpreter frame requires deoptimizing the stack, and Instrumentation::InstrumentThreadStack
 // needs the mutator lock held exclusively, which an entry hook (held shared / Runnable) cannot take.
@@ -496,6 +677,60 @@ void RunMutateCallback(Thread* self, const Rule* rule, ShadowFrame* sf, ArtMetho
       // SSLPeerUnverifiedException.<init>: if the caller is a void-returning method (a pinning-style
       // check that throws this exception directly), force it to return instead of throwing.
       ForceStepOutVoidCaller(self);
+      break;
+    }
+    case kCbProcessBuilderSpoofCommand: {
+      // java.lang.ProcessBuilder.start(): shell-based RASP probes exec commands like `which su`,
+      // `getprop <key>`, or `su`. Inspect the receiver's command list and, when it matches a probe,
+      // replace it with one that yields benign faked output; then let start() run. Fail-safe: any
+      // missing field / failed invoke leaves the command untouched and the process runs as-is.
+      mirror::Object* pb = GetReceiver(sf, method);
+      if (pb == nullptr) {
+        return;
+      }
+      ArtField* f_cmd = FindInstanceFieldByName(pb->GetClass(), kProcessBuilderCommandField, Primitive::kPrimNot);
+      if (f_cmd == nullptr) {
+        return;
+      }
+      StackHandleScope<2> hs(self);
+      Handle<mirror::Object> pb_h(hs.NewHandle(pb));
+      Handle<mirror::Object> cmd(hs.NewHandle(f_cmd->GetObject(pb)));
+      if (cmd == nullptr) {
+        return;
+      }
+      ObjPtr<mirror::Object> repl;
+      const bool is_which =
+          ListContains(self, cmd, kCmdWhich) || ListContains(self, cmd, kCmdWhichPath);
+      if (is_which) {
+        if (ListContains(self, cmd, kCmdSu)) {
+          repl = MakeStringList(self, {kCmdWhich, kFakeSu});
+        }
+      } else if (ListContainsAnyOf(self, cmd, kPropSecureBoot)) {
+        repl = MakeStringList(self, {kCmdEcho, kFakeSecureValue});
+      } else if (ListContainsAnyOf(self, cmd, kPropDebuggableQemu)) {
+        repl = MakeStringList(self, {kCmdEcho, kFakeDebuggableValue});
+      } else if (ListContainsAnyOf(self, cmd, kPropBuildType)) {
+        repl = MakeStringList(self, {kCmdEcho, kFakeBuildType});
+      } else if (ListContainsAnyOf(self, cmd, kPropBuildTags)) {
+        repl = MakeStringList(self, {kCmdEcho, kFakeBuildTags});
+      } else if (ListContainsAnyOf(self, cmd, kPropBootState)) {
+        repl = MakeStringList(self, {kCmdEcho, kFakeVerifiedBootState});
+      } else if (ListContainsAnyOf(self, cmd, kPropBrand)) {
+        repl = MakeStringList(self, {kCmdEcho, kFakeBrand});
+      } else if (ListContainsAnyOf(self, cmd, kPropDevice)) {
+        repl = MakeStringList(self, {kCmdEcho, kFakeModel});
+      } else if (ListContainsAnyOf(self, cmd, kPropHardware)) {
+        repl = MakeStringList(self, {kCmdEcho, kFakeHardware});
+      } else if (ListContainsAnyOf(self, cmd, kPropBuildFingerprint)) {
+        repl = MakeStringList(self, {kCmdEcho, kFingerprint});
+      } else if (ListContains(self, cmd, kCmdSu) || ListContains(self, cmd, kCmdSuPath)) {
+        repl = MakeStringList(self, {kFakeSu});
+      } else if (ListEqualsSingleton(self, cmd, kCmdGetprop)) {
+        repl = MakeStringList(self, {kCmdEcho, kFakeGetpropOutput});
+      }
+      if (repl != nullptr) {
+        f_cmd->SetObject<false>(pb_h.Get(), repl);
+      }
       break;
     }
     default:
