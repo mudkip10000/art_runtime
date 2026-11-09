@@ -215,7 +215,7 @@ bool g_cat_ssl = false;            // dalvik.vm.scanner-ssl
 bool g_cat_pkg = false;            // dalvik.vm.scanner-package
 bool g_cat_secure = false;         // dalvik.vm.scanner-secure-flag
 bool g_cat_debugger = false;       // dalvik.vm.scanner-debugger (deferred until a debugger attaches)
-bool g_verbose = false;            // dalvik.vm.scanner-verbose (log each rule that fires)
+bool g_verbose = false;            // dalvik.vm.scanner-verbose (log all scanner-hook activity; off by default)
 
 bool CategoryEnabled(RuleCategory c) {
   switch (c) {
@@ -931,10 +931,12 @@ void DoInstall() REQUIRES_SHARED(Locks::mutator_lock_) {
     g_pending_deopt.clear();
   }
 
-  LOG(INFO) << "scanner: hooks installed for process " << g_target_package << " ("
-            << deopted << " methods deoptimized"
-            << ", wait_for_debugger_resolved=" << (g_wait_for_debugger != nullptr)
-            << ", empty_list_resolved=" << (g_empty_list != nullptr) << ")";
+  if (g_verbose) {
+    LOG(INFO) << "scanner: hooks installed for process " << g_target_package << " ("
+              << deopted << " methods deoptimized"
+              << ", wait_for_debugger_resolved=" << (g_wait_for_debugger != nullptr)
+              << ", empty_list_resolved=" << (g_empty_list != nullptr) << ")";
+  }
 }
 
 // Installs the hooks if `candidate` (a process name or package name) matches the configured target,
@@ -943,8 +945,10 @@ void DoInstall() REQUIRES_SHARED(Locks::mutator_lock_) {
 void MaybeInstall(const char* source, const std::string& candidate)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   const std::string& pkg = Runtime::Current()->GetProcessPackageName();
-  LOG(INFO) << "scanner: AppInfo." << source << "='" << candidate << "' processPackage='" << pkg
-            << "' target='" << g_target_package << "'";
+  if (g_verbose) {
+    LOG(INFO) << "scanner: AppInfo." << source << "='" << candidate << "' processPackage='" << pkg
+              << "' target='" << g_target_package << "'";
+  }
   if (g_target_package.empty()) {
     return;
   }
@@ -1033,10 +1037,12 @@ void ScannerHooks::Install() {
   Thread* self = Thread::Current();
   std::string proc_name = ReadProcName();
   bool is_target = NameMatchesTarget(proc_name);
-  LOG(INFO) << "scanner: Install procName='" << proc_name << "' target='" << g_target_package
-            << "' match=" << is_target << " (rasp=" << g_cat_rasp << " ssl=" << g_cat_ssl
-            << " pkg=" << g_cat_pkg << " secure=" << g_cat_secure
-            << " debugger=" << g_cat_debugger << ")";
+  if (g_verbose) {
+    LOG(INFO) << "scanner: Install procName='" << proc_name << "' target='" << g_target_package
+              << "' match=" << is_target << " (rasp=" << g_cat_rasp << " ssl=" << g_cat_ssl
+              << " pkg=" << g_cat_pkg << " secure=" << g_cat_secure
+              << " debugger=" << g_cat_debugger << ")";
+  }
 
   ScopedObjectAccess soa(self);
   if (is_target) {
@@ -1060,7 +1066,9 @@ void ScannerHooks::OnProcessPackageName(const char* package_name) {
     return;  // not our target process
   }
   Thread* self = Thread::Current();
-  LOG(INFO) << "scanner: OnProcessPackageName matched target '" << package_name << "'; installing";
+  if (g_verbose) {
+    LOG(INFO) << "scanner: OnProcessPackageName matched target '" << package_name << "'; installing";
+  }
   ScopedObjectAccess soa(self);  // JNI native context is kNative; DoInstall needs Runnable
   DoInstall();
 }
