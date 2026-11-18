@@ -632,11 +632,14 @@ void RunMutateCallback(Thread* self, const Rule* rule, ShadowFrame* sf, ArtMetho
       // bindService(Intent, ServiceConnection, int): when the Intent's action is a Play Integrity /
       // SafetyNet bind, repoint it from the real GMS/Play package to the decoy helper app
       // (kBindServiceSpoofPackage), which answers with stub/benign results.
-      mirror::Object* intent = GetArgObject(sf, method, 0);
-      if (intent == nullptr) {
+      mirror::Object* intent_raw = GetArgObject(sf, method, 0);
+      if (intent_raw == nullptr) {
         return;
       }
-      ObjPtr<mirror::String> action = GetStringFieldOf(intent, kIntentActionField);
+      // hold the Intent in a handle because the allocation below can move-GC and relocate it before the write
+      StackHandleScope<1> hs(self);
+      Handle<mirror::Object> intent(hs.NewHandle(intent_raw));
+      ObjPtr<mirror::String> action = GetStringFieldOf(intent.Get(), kIntentActionField);
       if (action == nullptr) {
         return;
       }
@@ -653,7 +656,7 @@ void RunMutateCallback(Thread* self, const Rule* rule, ShadowFrame* sf, ArtMetho
       ObjPtr<mirror::String> fake =
           mirror::String::AllocFromModifiedUtf8(self, kBindServiceSpoofPackage);
       if (fake != nullptr) {
-        SetStringField(intent, kIntentPackageField, fake);
+        SetStringField(intent.Get(), kIntentPackageField, fake);
       }
       break;
     }

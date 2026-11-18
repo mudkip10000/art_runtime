@@ -279,10 +279,13 @@ ObjPtr<mirror::String> GetStringArg(ShadowFrame* sf, ArtMethod* method, int logi
   for (size_t s = 1; shorty[s] != '\0'; ++s) {
     if (param == logical_pos) {
       if (shorty[s] != 'L') {
-        return nullptr;  // predicate positions are always String in the table
+        return nullptr;  // not a reference position; no String predicate possible
       }
       mirror::Object* o = sf->GetVRegReference(slot);
-      return (o == nullptr) ? ObjPtr<mirror::String>(nullptr) : o->AsString();
+      if (o == nullptr || !o->IsString()) {
+        return nullptr;  // fail-safe: a non-String reference (e.g. VersionedPackage) never matches
+      }
+      return o->AsString();
     }
     slot += (shorty[s] == 'J' || shorty[s] == 'D') ? 2 : 1;
     ++param;
