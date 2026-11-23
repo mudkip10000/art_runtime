@@ -9,11 +9,13 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <sys/prctl.h>
@@ -49,6 +51,25 @@
 #include "thread-inl.h"
 #include "thread_list.h"
 
+// libc / ELF interfaces used by the native-hook layer (scanner_hooks_native.inc).
+#include <dlfcn.h>
+#include <elf.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <link.h>
+#include <pthread.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/uio.h>
+#include <sys/syscall.h>
+#include <sys/system_properties.h>
+#include <unistd.h>
+#include <cstdarg>
+#include <cstdio>
+
 namespace art {
 
 namespace {
@@ -80,6 +101,7 @@ constexpr const char* kPropPackage = "dalvik.vm.scanner-package";
 constexpr const char* kPropSecureFlag = "dalvik.vm.scanner-secure-flag";
 constexpr const char* kPropDebugger = "dalvik.vm.scanner-debugger";
 constexpr const char* kPropVerbose = "dalvik.vm.scanner-verbose";
+constexpr const char* kPropNativeRasp = "dalvik.vm.scanner-native-rasp";  // one switch for the whole native-layer bypass (libc PLT/GOT hooks + seccomp /proc sanitizer + in-process property patch)
 
 // ---------------------------------------------------------------------------
 // Rule table
@@ -130,6 +152,10 @@ enum CallbackId {
   // kCallbackReturn (mutate state, then force-return void):
   kCbJarFileSkipVerifier = 9,  // JarFile.maybeInstantiateVerifier: disable JAR signature verification
                                // (verify=false, jv=null) and skip the method body
+  // kCallbackReturn (compute + force-return):
+  kCbSpoofSettingsCursor = 10,  // ContentResolver.query(content://settings/.../adb_enabled etc.):
+                                // return a fabricated MatrixCursor reporting the setting value as 0
+                                // (off), for the direct-content-query ADB/developer-options probes
 };
 
 struct Rule {
@@ -216,6 +242,10 @@ bool g_cat_pkg = false;            // dalvik.vm.scanner-package
 bool g_cat_secure = false;         // dalvik.vm.scanner-secure-flag
 bool g_cat_debugger = false;       // dalvik.vm.scanner-debugger (deferred until a debugger attaches)
 bool g_verbose = false;            // dalvik.vm.scanner-verbose (log all scanner-hook activity; off by default)
+// The three below are all driven by the single dalvik.vm.scanner-native-rasp flag
+bool g_cat_native = false;         // native libc property/file PLT-GOT hook layer
+bool g_cat_syshook = false;        // seccomp spoofer; sanitize /proc, deny emulator/root paths
+bool g_cat_propspoof = false;      // COW-remap the inherited property-area mappings and patch emulator props in place at install
 
 bool CategoryEnabled(RuleCategory c) {
   switch (c) {
@@ -229,7 +259,8 @@ bool CategoryEnabled(RuleCategory c) {
 }
 
 bool AnyCategoryEnabled() {
-  return g_cat_rasp || g_cat_ssl || g_cat_pkg || g_cat_secure || g_cat_debugger;
+  return g_cat_rasp || g_cat_ssl || g_cat_pkg || g_cat_secure || g_cat_debugger || g_cat_native ||
+         g_cat_syshook || g_cat_propspoof;
 }
 
 // Per-thread pending forced returns: MethodEntered pushes, NonStandardExitPopped consumes. The
@@ -403,6 +434,15 @@ mirror::Object* GetReceiver(ShadowFrame* sf, ArtMethod* method) REQUIRES_SHARED(
 // rather than with the general frame-inspection helpers above. Included here, after those helpers it
 // depends on and before the listener that dispatches to it.
 #include "scanner_hooks_scripts.inc"
+
+// Native interception layer: PLT/GOT hooks of libc property/file reads, for RASP that reads the
+// anti-debug / anti-emulator signals in native code (bypassing the managed facades the rules above
+// cover). Independent of the managed engine; installed from DoInstall when dalvik.vm.scanner-native
+// is set. Included here, inside the anonymous namespace, after the managed helpers.
+#include "scanner_hooks_native.inc"
+
+// Seccomp syscall layer for RASP that reads via raw syscalls below libc: the /proc-sanitizing and emulator/root path-deny spoofer (dalvik.vm.scanner-syshook) and the in-process property patch (dalvik.vm.scanner-propspoof). Installed from DoInstall when either is set.
+#include "scanner_hooks_syscall.inc"
 
 bool InArgValues(const Rule* rule, ObjPtr<mirror::String> s) REQUIRES_SHARED(Locks::mutator_lock_) {
   if (s == nullptr) {
@@ -934,6 +974,17 @@ void DoInstall() REQUIRES_SHARED(Locks::mutator_lock_) {
     g_pending_deopt.clear();
   }
 
+  // Install the native interception layer (libc property/file reads) if enabled. Pure native GOT
+  // patching, so it runs here (outside the suspend-all) and never touches managed state.
+  if (g_cat_native) {
+    InstallNativeHooks();
+  }
+
+  // Trap file-path syscalls (including the protector's raw svc) for syshook and propspoof
+  if (g_cat_syshook || g_cat_propspoof) {
+    InstallSeccompTracer();
+  }
+
   if (g_verbose) {
     LOG(INFO) << "scanner: hooks installed for process " << g_target_package << " ("
               << deopted << " methods deoptimized"
@@ -1027,6 +1078,11 @@ void ScannerHooks::Install() {
   g_cat_secure = android::base::GetBoolProperty(kPropSecureFlag, false);
   g_cat_debugger = android::base::GetBoolProperty(kPropDebugger, false);
   g_verbose = android::base::GetBoolProperty(kPropVerbose, false);
+  // The three native-layer mechanisms share one flag: they are complementary (libc-routed, raw-syscall /proc, and mmap'd properties) and always deployed together
+  bool native_rasp = android::base::GetBoolProperty(kPropNativeRasp, false);
+  g_cat_native = native_rasp;
+  g_cat_syshook = native_rasp;
+  g_cat_propspoof = native_rasp;
   // Device API level, used by the Google-package spoof rules to pick version-specific object shapes.
   g_sdk_int = android::base::GetIntProperty("ro.build.version.sdk", 0);
   if (g_target_package.empty() || !AnyCategoryEnabled()) {

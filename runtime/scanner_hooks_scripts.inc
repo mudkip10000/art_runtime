@@ -310,7 +310,9 @@ constexpr const char* kFakeGetpropOutput =
     "ro.product.model=pixel\n"
     "ro.product.name=exynos2100\n"
     "ro.hardware=exynos2100\n"
-    "ro.build.fingerprint=google/exynos2100/pixel:14/google/google:user/release-keys\n";
+    "ro.build.fingerprint=google/exynos2100/pixel:14/google/google:user/release-keys\n"
+    "sys.usb.state=mtp\n"
+    "sys.usb.config=mtp\n";
 
 // ProcessBuilder.start() command-spoof tokens: the shell probes RASP code runs (which / su /
 // getprop) and the fake `su` name swapped in. The getprop property keys and their faked values are
@@ -439,6 +441,120 @@ ObjPtr<mirror::Object> MakeStringList(Thread* self, const std::vector<const char
 }
 
 // ---------------------------------------------------------------------------
+// Settings-content-query cursor spoof (kCbSpoofSettingsCursor) helpers
+// ---------------------------------------------------------------------------
+constexpr const char* kMatrixCursorDescriptor = "Landroid/database/MatrixCursor;";
+constexpr const char* kMatrixCursorCtorSig = "([Ljava/lang/String;)V";
+constexpr const char* kMatrixCursorAddRowName = "addRow";
+constexpr const char* kMatrixCursorAddRowSig = "([Ljava/lang/Object;)V";
+constexpr const char* kObjectArrayDescriptor = "[Ljava/lang/Object;";
+constexpr const char* kUriToStringName = "toString";
+constexpr const char* kUriToStringSig = "()Ljava/lang/String;";
+// Settings-provider column names. The fabricated cursor mirrors the query's projection, filling
+// "value" with the spoofed value, "name" with the setting key, "_id" with "0", and any other
+// projected column with the value. This makes both positional reads (an app that projects
+// ["value"] and reads getString(0)) and named reads (getColumnIndex("value")) correct.
+constexpr const char* kSettingsColumnId = "_id";
+constexpr const char* kSettingsColumnName = "name";
+constexpr const char* kSettingsColumnValue = "value";
+
+// Allocates the array class named by `array_descriptor` ("[Ljava/lang/String;" or
+// "[Ljava/lang/Object;") holding `items` as freshly allocated Strings. Null on any allocation
+// failure. Each String is stored immediately after it is built, so no alloc falls between build and
+// Set (the array handle keeps it alive).
+ObjPtr<mirror::ObjectArray<mirror::Object>> BuildStringCells(Thread* self,
+                                                            const char* array_descriptor,
+                                                            const std::vector<std::string>& items)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  StackHandleScope<2> hs(self);
+  Handle<mirror::Class> arr_class(hs.NewHandle(ResolveSystemClass(self, array_descriptor)));
+  if (arr_class == nullptr) {
+    return nullptr;
+  }
+  Handle<mirror::ObjectArray<mirror::Object>> arr(hs.NewHandle(
+      mirror::ObjectArray<mirror::Object>::Alloc(self, arr_class.Get(),
+                                                 static_cast<int32_t>(items.size()))));
+  if (arr == nullptr) {
+    self->ClearException();
+    return nullptr;
+  }
+  for (size_t i = 0; i < items.size(); ++i) {
+    ObjPtr<mirror::String> s = mirror::String::AllocFromModifiedUtf8(self, items[i].c_str());
+    if (s == nullptr) {
+      self->ClearException();
+      return nullptr;
+    }
+    arr->Set(static_cast<int32_t>(i), s);
+  }
+  return arr.Get();
+}
+
+// Builds a MatrixCursor whose columns are exactly `columns` (the query's projection, or {_id, name,
+// value} when the app passed none) and that has one row: "value" -> the spoofed value, "name" -> the
+// setting key, "_id" -> "0", any other projected column -> the value. Mirroring the projection makes
+// both positional reads (projection ["value"] then getString(0)) and named reads correct. _id is
+// carried as the string "0" (MatrixCursor.getLong/getInt parse it, getString returns it), so no
+// boxing is needed. Returns null on any missing class/ctor/method or allocation failure, so the
+// caller no-ops and the real query runs.
+ObjPtr<mirror::Object> BuildSettingsCursor(Thread* self, const std::vector<std::string>& columns,
+                                           const char* name, const char* value)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  std::vector<std::string> cells;
+  cells.reserve(columns.size());
+  for (const std::string& col : columns) {
+    if (col == kSettingsColumnName) {
+      cells.emplace_back(name);
+    } else if (col == kSettingsColumnId) {
+      cells.emplace_back("0");
+    } else {
+      cells.emplace_back(value);  // "value", or any other projected column: report the spoofed value
+    }
+  }
+  StackHandleScope<4> hs(self);
+  Handle<mirror::Class> mc_class(hs.NewHandle(ResolveSystemClass(self, kMatrixCursorDescriptor)));
+  if (mc_class == nullptr) {
+    return nullptr;
+  }
+  Handle<mirror::ObjectArray<mirror::Object>> cols(hs.NewHandle(
+      BuildStringCells(self, kStringArrayDescriptor, columns)));
+  if (cols == nullptr) {
+    return nullptr;
+  }
+  ArtMethod* ctor = mc_class->FindClassMethod(kCtorName, kMatrixCursorCtorSig, kRuntimePointerSize);
+  if (ctor == nullptr) {
+    return nullptr;
+  }
+  Handle<mirror::Object> cursor(hs.NewHandle(mc_class->AllocObject(self)));
+  if (cursor == nullptr) {
+    self->ClearException();
+    return nullptr;
+  }
+  // args = [receiver, cols], shorty "VL"
+  uint32_t cargs[2] = {RefSlot(cursor.Get()), RefSlot(cols.Get())};
+  JValue cres;
+  if (!InvokeManaged(self, ctor, cargs, sizeof(cargs), "VL", &cres)) {
+    return nullptr;
+  }
+  Handle<mirror::ObjectArray<mirror::Object>> row(hs.NewHandle(
+      BuildStringCells(self, kObjectArrayDescriptor, cells)));
+  if (row == nullptr) {
+    return nullptr;
+  }
+  ArtMethod* add_row = mc_class->FindClassMethod(kMatrixCursorAddRowName, kMatrixCursorAddRowSig,
+                                                 kRuntimePointerSize);
+  if (add_row == nullptr) {
+    return nullptr;
+  }
+  // args = [receiver, row], shorty "VL"
+  uint32_t rargs[2] = {RefSlot(cursor.Get()), RefSlot(row.Get())};
+  JValue rres;
+  if (!InvokeManaged(self, add_row, rargs, sizeof(rargs), "VL", &rres)) {
+    return nullptr;
+  }
+  return cursor.Get();
+}
+
+// ---------------------------------------------------------------------------
 // kCallbackReturn: compute a return value (may invoke managed code)
 // ---------------------------------------------------------------------------
 
@@ -546,6 +662,68 @@ CallbackReturnResult RunCallbackReturn(Thread* self, const Rule* rule, ShadowFra
       r.ok = true;
       r.is_void = true;  // maybeInstantiateVerifier returns void
       return r;
+    }
+    case kCbSpoofSettingsCursor: {
+      // Settings Uri for an ADB / developer-options key -> fabricated cursor reporting 0 (off).
+      // Any other Uri -> fail (the real query runs unmodified).
+      mirror::Object* uri = GetArgObject(sf, method, 0);
+      if (uri == nullptr) {
+        return fail;
+      }
+      StackHandleScope<1> hs(self);
+      Handle<mirror::Object> uri_h(hs.NewHandle(uri));
+      ArtMethod* to_string =
+          uri_h->GetClass()->FindClassMethod(kUriToStringName, kUriToStringSig, kRuntimePointerSize);
+      if (to_string == nullptr) {
+        return fail;
+      }
+      uint32_t args[1] = {RefSlot(uri_h.Get())};
+      JValue res;
+      if (!InvokeManaged(self, to_string, args, sizeof(args), "L", &res)) {
+        return fail;
+      }
+      ObjPtr<mirror::Object> uri_str_obj = res.GetL();
+      if (uri_str_obj == nullptr || !uri_str_obj->IsString()) {
+        return fail;
+      }
+      std::string uri_str = uri_str_obj->AsString()->ToModifiedUtf8();
+      if (uri_str.rfind(kSettingsContentPrefix, 0) != 0) {
+        return fail;
+      }
+      const char* matched_key = nullptr;
+      for (const char* suffix : kSettingsAdbDevUriSuffixes) {
+        const size_t slen = std::strlen(suffix);
+        if (uri_str.size() >= slen && uri_str.compare(uri_str.size() - slen, slen, suffix) == 0) {
+          matched_key = suffix + 1;  // drop the leading '/': the bare setting name
+          break;
+        }
+      }
+      if (matched_key == nullptr) {
+        return fail;  // a settings uri, but not one of the ADB / dev-options keys
+      }
+      // Mirror the query's projection (arg 1, a String[]) so the fabricated cursor's columns match
+      // what the caller reads. Read the names into a native vector before any allocation (no GC
+      // safepoint between). An absent/empty projection falls back to the provider's default columns.
+      std::vector<std::string> columns;
+      mirror::Object* proj = GetArgObject(sf, method, 1);
+      if (proj != nullptr && proj->GetClass()->IsObjectArrayClass()) {
+        ObjPtr<mirror::ObjectArray<mirror::Object>> parr = proj->AsObjectArray<mirror::Object>();
+        const int32_t plen = parr->GetLength();
+        for (int32_t i = 0; i < plen; ++i) {
+          ObjPtr<mirror::Object> e = parr->Get(i);
+          if (e != nullptr && e->IsString()) {
+            columns.push_back(e->AsString()->ToModifiedUtf8());
+          }
+        }
+      }
+      if (columns.empty()) {
+        columns = {kSettingsColumnId, kSettingsColumnName, kSettingsColumnValue};
+      }
+      ObjPtr<mirror::Object> cursor = BuildSettingsCursor(self, columns, matched_key, kFakeSettingOff);
+      if (cursor == nullptr) {
+        return fail;
+      }
+      return MakeObjectResult(self, cursor);
     }
     default:
       return fail;
@@ -726,6 +904,10 @@ void RunMutateCallback(Thread* self, const Rule* rule, ShadowFrame* sf, ArtMetho
         repl = MakeStringList(self, {kCmdEcho, kFakeHardware});
       } else if (ListContainsAnyOf(self, cmd, kPropBuildFingerprint)) {
         repl = MakeStringList(self, {kCmdEcho, kFingerprint});
+      } else if (ListContainsAnyOf(self, cmd, kPropAdbTcpPort)) {
+        repl = MakeStringList(self, {kCmdEcho, kFakeAdbTcpPort});
+      } else if (ListContainsAnyOf(self, cmd, kPropUsbState)) {
+        repl = MakeStringList(self, {kCmdEcho, kFakeUsbState});
       } else if (ListContains(self, cmd, kCmdSu) || ListContains(self, cmd, kCmdSuPath)) {
         repl = MakeStringList(self, {kFakeSu});
       } else if (ListEqualsSingleton(self, cmd, kCmdGetprop)) {

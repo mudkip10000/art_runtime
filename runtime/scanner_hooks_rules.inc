@@ -23,6 +23,14 @@ const char* const kPropBuildType[] = {"ro.build.type"};
 const char* const kPropBootState[] = {"ro.boot.verifiedbootstate"};
 const char* const kPropBuildFingerprint[] = {"ro.build.fingerprint"};
 const char* const kPropBuildTags[] = {"ro.build.tags"};
+// Set to the adbd TCP port while wireless/TCP debugging is active; the pre-API-30 wireless-debug
+// probe reads it (SystemProperties.get or `getprop service.adb.tcp.port`) and treats a non-empty
+// port as "on". Forced to look unset.
+const char* const kPropAdbTcpPort[] = {"service.adb.tcp.port"};
+// sys.usb.state / sys.usb.config list the active USB gadget functions; they contain "adb" while USB
+// debugging is on over the cable. A getprop/SystemProperties read of either is forced to a benign
+// value with no "adb" function.
+const char* const kPropUsbState[] = {"sys.usb.state", "sys.usb.config"};
 // Spoofed values for the property probes above, shared by the SystemProperties.get rule rows and
 // the ProcessBuilder getprop-spoof in scanner_hooks_scripts.inc (single source for both paths).
 const char* const kFakeSecureValue = "1";
@@ -33,6 +41,11 @@ const char* const kFakeVerifiedBootState = "green";
 const char* const kFakeBrand = "google";
 const char* const kFakeModel = "pixel";
 const char* const kFakeHardware = "exynos2100";
+// service.adb.tcp.port reads empty when TCP adb is not listening; an empty value is the faithful
+// "off" answer for both SystemProperties.get and the shell getprop spoof.
+const char* const kFakeAdbTcpPort = "";
+// USB gadget state for a device whose USB debugging is off (media-transfer, no "adb" function).
+const char* const kFakeUsbState = "mtp";
 const char* const kPropEmulator[] = {
     "init.svc.qemu-adb-keys", "init.svc.qemu-adb-setup", "init.svc.qemu-device-state",
     "init.svc.qemu-props", "init.svc_debug_pid.qemu-adb-keys",
@@ -51,7 +64,23 @@ const char* const kSettingsSecure[] = {"install_non_market_apps",
                                        "unknown_sources_default_reversed"};
 const char* const kSettingsPlayStore[] = {"phone_play_store_availability",
                                           "verifier_verify_adb_installs"};
-const char* const kSettingsAdb[] = {"adb_enabled", "adb_wifi_enabled", "upload_apk_enable"};
+// ADB / developer-options toggles an app reads to detect debugging, all forced to 0 (off):
+//   adb_enabled                  -> USB debugging enabled
+//   adb_wifi_enabled             -> wireless debugging enabled (API 30+)
+//   development_settings_enabled -> developer options unlocked
+// Hooked on both Settings.Global and Settings.Secure (apps read either namespace). The same keys
+// back the direct content://settings/... query spoof (kCbSpoofSettingsCursor). upload_apk_enable is
+// an unrelated Google test-infrastructure toggle also forced off here.
+const char* const kSettingsAdbDevOptions[] = {"adb_enabled", "adb_wifi_enabled",
+                                              "development_settings_enabled", "upload_apk_enable"};
+// Direct-content-query variant of the probe above: an app reads the same toggles by querying
+// content://settings/{global,secure}/<key> through ContentResolver.query, bypassing the
+// Settings.getInt facade (see kCbSpoofSettingsCursor). upload_apk_enable is intentionally omitted
+// here (not a debugging probe).
+constexpr const char* kSettingsContentPrefix = "content://settings/";
+const char* const kSettingsAdbDevUriSuffixes[] = {"/adb_enabled", "/adb_wifi_enabled",
+                                                  "/development_settings_enabled"};
+constexpr const char* kFakeSettingOff = "0";
 // Play Integrity / SafetyNet service-bind actions that are redirected from the real Play/GMS
 // package to the decoy helper app.
 const char* const kIntegrityBindActions[] = {
@@ -82,7 +111,7 @@ const char* const kRootPaths[] = {
 #define ARR(a) (a), static_cast<int>(sizeof(a) / sizeof((a)[0]))
 
 const char kFingerprint[] =
-    "google/exynos2100/pixel:14/google/google:user/release-keys";
+    "google/exynos2100/pixel:14/UP1A.231005.007/10000000:user/release-keys";
 
 // java.util.Collections.EMPTY_LIST - the object kConstEmptyList rules force-return (resolved once
 // at install by ResolveEmptyList).
@@ -212,6 +241,15 @@ const Rule kRules[] = {
      false, 0, "pixel"},
     {RASP, "Landroid/os/Build;", "MODEL", true, kNoArg, nullptr, 0, ActionKind::kFieldSetString,
      false, 0, "pixel"},
+    // BOARD/DISPLAY are the strong remaining emulator tells; BOOTLOADER/HOST complete the coverage, with DISPLAY and the BOOTLOADER incremental suffix kept consistent with kFingerprint
+    {RASP, "Landroid/os/Build;", "BOARD", true, kNoArg, nullptr, 0, ActionKind::kFieldSetString,
+     false, 0, "exynos2100"},
+    {RASP, "Landroid/os/Build;", "DISPLAY", true, kNoArg, nullptr, 0, ActionKind::kFieldSetString,
+     false, 0, "UP1A.231005.007"},
+    {RASP, "Landroid/os/Build;", "BOOTLOADER", true, kNoArg, nullptr, 0,
+     ActionKind::kFieldSetString, false, 0, "pixel-1.0-10000000"},
+    {RASP, "Landroid/os/Build;", "HOST", true, kNoArg, nullptr, 0, ActionKind::kFieldSetString,
+     false, 0, "abfarm-release"},
 
     // android.os.Build.getRadioVersion
     {RASP, "Landroid/os/Build;", "getRadioVersion", false, kNoArg, nullptr, 0,
@@ -248,13 +286,24 @@ const Rule kRules[] = {
      ActionKind::kConstString, false, 0, kFakeBuildTags},
     {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropEmulator),
      ActionKind::kConstNull, false, 0, nullptr},
+    // service.adb.tcp.port via SystemProperties: get() -> "" (unset) and getInt() -> -1 (the
+    // conventional "not listening" sentinel), so a non-empty / positive port is never seen.
+    {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropAdbTcpPort),
+     ActionKind::kConstString, false, 0, kFakeAdbTcpPort},
+    {RASP, "Landroid/os/SystemProperties;", "getInt", false, 0, ARR(kPropAdbTcpPort),
+     ActionKind::kConstInt, false, -1, nullptr},
+    // sys.usb.state / sys.usb.config: hide the "adb" USB gadget function (USB-debugging-over-cable probe).
+    {RASP, "Landroid/os/SystemProperties;", "get", false, 0, ARR(kPropUsbState),
+     ActionKind::kConstString, false, 0, kFakeUsbState},
 
     // android.provider.Settings.Secure / .Global getInt, gated by the setting name argument
     {RASP, "Landroid/provider/Settings$Secure;", "getInt", false, 1, ARR(kSettingsSecure),
      ActionKind::kConstInt, false, 0, nullptr},
     {RASP, "Landroid/provider/Settings$Global;", "getInt", false, 1, ARR(kSettingsPlayStore),
      ActionKind::kConstInt, false, 1, nullptr},
-    {RASP, "Landroid/provider/Settings$Global;", "getInt", false, 1, ARR(kSettingsAdb),
+    {RASP, "Landroid/provider/Settings$Global;", "getInt", false, 1, ARR(kSettingsAdbDevOptions),
+     ActionKind::kConstInt, false, 0, nullptr},
+    {RASP, "Landroid/provider/Settings$Secure;", "getInt", false, 1, ARR(kSettingsAdbDevOptions),
      ActionKind::kConstInt, false, 0, nullptr},
 
     // android.security.keystore.*
@@ -369,6 +418,14 @@ const Rule kRules[] = {
     {RASP, "Landroid/content/pm/IPackageManager;", "getApplicationInfo", false, kNoArg, nullptr, 0,
      ActionKind::kCallbackMutateReturn, false, kCbClearApplicationInfoDebuggable, nullptr, nullptr,
      true, 0},
+
+    // RASP: ContentResolver.query - an app reads the adb / dev-options toggles by querying the
+    // settings provider directly (content://settings/{global,secure}/<key>) instead of
+    // Settings.getInt; kCbSpoofSettingsCursor returns a fabricated cursor reporting 0 (off). query()
+    // is final on ContentResolver and not overridden by subclasses, so the exact-class match covers
+    // all callers.
+    {RASP, "Landroid/content/ContentResolver;", "query", false, kNoArg, nullptr, 0,
+     ActionKind::kCallbackReturn, false, kCbSpoofSettingsCursor, nullptr, nullptr, false, 'L'},
 
     // RASP: java.lang.ProcessBuilder.start(). Shell-based probes exec commands (which su / getprop /
     // su); rewrite the receiver's command list so they yield benign faked output, then let start()
