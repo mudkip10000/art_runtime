@@ -549,7 +549,12 @@ static int __sigaction(int signal, const SigactionType* new_action,
                        SigactionType* old_action,
                        int (*linked)(int, const SigactionType*,
                                      SigactionType*)) {
-  if (is_signal_hook_debuggable) {
+  // DEBUG_IGNORE_APP_SIGNAL_HANDLER drops an app's own signal handlers so they cannot swallow the
+  // crash signals the debugger and tombstone need. It must NOT drop SIGSYS: an app that routes its own
+  // syscalls through a seccomp trap services the resulting SIGSYS in an SA_SIGINFO handler it installs
+  // here, so silently discarding that handler turns a routine trapped syscall into a fatal SYS_SECCOMP
+  // termination on that thread. Let SIGSYS install normally.
+  if (is_signal_hook_debuggable && signal != SIGSYS) {
     return 0;
   }
 

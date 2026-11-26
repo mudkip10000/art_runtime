@@ -46,12 +46,18 @@ constexpr const char* kPkgSignaturesField = "signatures";          // Signature[
 constexpr const char* kPkgSigningInfoField = "signingInfo";        // SigningInfo
 constexpr const char* kPkgPackageNameField = "packageName";        // String
 constexpr const char* kPkgApplicationInfoField = "applicationInfo";  // ApplicationInfo
+constexpr const char* kPkgVersionCodeField = "versionCode";        // int
 constexpr const char* kAppInfoFlagsField = "flags";                // int
 constexpr const char* kAppInfoEnabledField = "enabled";            // boolean
 constexpr const char* kCtorName = "<init>";
 
 constexpr const char* kFakeGooglePackageName = "com.android.vending";
 constexpr int32_t kFakeGoogleAppInfoFlags = 129;  // FLAG_SYSTEM | FLAG_UPDATED_SYSTEM_APP
+// A fabricated Google PackageInfo must report a modern Play Services version: callers version-gate on
+// it, and a 0 (default) sends some down legacy code paths that are broken on current Android -- e.g.
+// firebase-iid takes a pre-12000000 registration branch that builds a PendingIntent without a
+// mutability flag, which throws on targetSdk >= 31 (S+) and crashes the app's startup.
+constexpr int32_t kFakeGoogleVersionCode = 240000000;
 
 constexpr int32_t kFlagDebuggable = 0x2;  // ApplicationInfo.FLAG_DEBUGGABLE
 
@@ -256,6 +262,11 @@ ObjPtr<mirror::Object> BuildPackageInfo(Thread* self, const char* package_name,
   }
   // applicationInfo for the fake Google package (best-effort)
   if (google_app_info) {
+    // versionCode: a 0 default makes version-gated callers take legacy paths (see kFakeGoogleVersionCode)
+    ArtField* f_vc = pi_class->FindDeclaredInstanceField(kPkgVersionCodeField, "I");
+    if (f_vc != nullptr) {
+      f_vc->SetInt<false>(pi.Get(), kFakeGoogleVersionCode);
+    }
     Handle<mirror::Class> ai_class(hs.NewHandle(ResolveSystemClass(self, kApplicationInfoDescriptor)));
     if (ai_class != nullptr) {
       ObjPtr<mirror::Object> ai = ai_class->AllocObject(self);

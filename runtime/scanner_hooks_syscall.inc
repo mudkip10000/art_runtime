@@ -1,9 +1,9 @@
 /*
  * scanner_hooks syscall layer: a seccomp user-notifier that traps file-path syscalls by NUMBER, so it fires regardless of who issued them.
  *
- * Why a seccomp notifier: the native PLT/GOT layer (scanner_hooks_native.inc) only sees reads that go through libc's exported functions, but hardened RASP (DexProtector, Ant/zoloz) issue their anti-debug / anti-emulator reads via raw `svc` instructions straight to the kernel, touching no libc GOT slot. Trapping by syscall number catches libc and the protector's own inline svc alike.
+ * Why a seccomp notifier: the native PLT/GOT layer (scanner_hooks_native.inc) only sees reads that go through libc's exported functions, but hardened RASP issues its anti-debug / anti-emulator reads via raw `svc` instructions straight to the kernel, touching no libc GOT slot. Trapping by syscall number catches libc and the protector's own inline svc alike.
  *
- * Two independent features, each gated on its own property, installed in the target process only:
+ * Two independent features, installed in the target process only:
  *   - syshook (dalvik.vm.scanner-syshook): serves sanitized /proc copies and returns ENOENT for emulator/root artifacts, so it does change what the trapped thread sees.
  *   - propspoof (dalvik.vm.scanner-propspoof): at install, COW-remaps the inherited bionic property-area mappings private-writable and patches emulator-identifying properties in place. It needs no syscall trap, but runs from InstallSeccompTracer because that is this layer's install hook.
  *
@@ -430,6 +430,17 @@ bool SeccompNotifSend(int fd, struct seccomp_notif_resp* resp) {
 // CONTINUE so the kernel runs the real syscall unchanged. The trapped thread is blocked until we
 // answer, so this must never itself issue a trapped syscall (logging uses an already-connected logd
 // socket, process_vm_readv and ioctl are not in the trap set).
+// Supervisor threads that recv on the listener fd in parallel (spawned by the installer). The kernel
+// hands each pending notification to exactly one recv, so a pool answers concurrent file opens across
+// the app's threads in parallel; a single supervisor serialized them, stretching an app's own
+// high-volume reads (e.g. a self-integrity hash over its apk/.so) from milliseconds to many seconds,
+// which trips timing-based tamper checks.
+constexpr int kSupervisorThreads = 24;
+// Serializes reads of the shared pre-opened sanitized fds (status, maps, smaps): ReadWholeFileFromFd
+// uses lseek+read, so parallel supervisors must not read one at the same time. Only these redirected
+// opens take this path (every other open continues without a redirect), so contention stays low.
+pthread_mutex_t g_status_fd_lock = PTHREAD_MUTEX_INITIALIZER;
+
 void* SeccompSupervisor(void* /*arg*/) {
   int fd = g_seccomp_notify_fd.load(std::memory_order_acquire);
   struct seccomp_notif_sizes sizes {};
@@ -443,10 +454,17 @@ void* SeccompSupervisor(void* /*arg*/) {
   for (;;) {
     std::memset(req, 0, reqbuf.size());
     if (ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV, req) != 0) {
-      if (errno == EINTR) {
-        continue;
+      // Only a closed listener fd (EBADF/ENOTCONN) means the process is tearing down and the loop may
+      // end. Every other error is transient and MUST NOT end the loop: USER_NOTIF has no kernel timeout,
+      // so if the supervisor exits while the process is alive, every future trapped openat/faccessat
+      // blocks forever with nobody to answer it, deadlocking the whole app. In particular ENOENT occurs
+      // when a queued notification is invalidated because its trapped thread was killed or unwound (e.g.
+      // by a RASP SIGSYS/SIGSEGV handler) between the kernel queuing it and this recv -- common under
+      // heavy thread churn and previously fatal here. EINTR is the ordinary signal-interruption case.
+      if (errno == EBADF || errno == ENOTCONN) {
+        break;
       }
-      break;  // listener closed: the process is going away
+      continue;
     }
     int nr = static_cast<int>(req->data.nr);
     char path[kSeccompPathMax];
@@ -469,7 +487,11 @@ void* SeccompSupervisor(void* /*arg*/) {
       if (rfd >= 0) {
         std::string real;
         std::string san;
-        if (ReadWholeFileFromFd(rfd, &real) && SanitizeContent(path, real, &san)) {
+        // The shared sanitized fd is read with lseek+read, so only one supervisor may touch it at a time
+        pthread_mutex_lock(&g_status_fd_lock);
+        bool read_ok = ReadWholeFileFromFd(rfd, &real);
+        pthread_mutex_unlock(&g_status_fd_lock);
+        if (read_ok && SanitizeContent(path, real, &san)) {
           int mem = MakeMemContentFd(san);
           if (mem < 0) {
             if (g_verbose) {
@@ -587,17 +609,27 @@ void InstallSeccompTracer() {
     return;
   }
   g_seccomp_notify_fd.store(static_cast<int>(fd), std::memory_order_release);
-  pthread_t th;
-  if (pthread_create(&th, nullptr, &SeccompSupervisor, nullptr) != 0) {
-    if (g_verbose) {
-      LOG(ERROR) << "scanner-syscall: supervisor thread create failed";
+  // Spawn a pool of supervisors. At least one must exist or every trapped syscall blocks forever with
+  // nobody to answer it; the rest only add parallelism, so their individual failure is non-fatal.
+  int spawned = 0;
+  for (int i = 0; i < kSupervisorThreads; ++i) {
+    pthread_t th;
+    if (pthread_create(&th, nullptr, &SeccompSupervisor, nullptr) != 0) {
+      if (g_verbose) {
+        LOG(ERROR) << "scanner-syscall: supervisor thread " << i << " create failed";
+      }
+      continue;
     }
+    pthread_detach(th);
+    ++spawned;
+  }
+  if (spawned == 0) {
     close(static_cast<int>(fd));
     g_seccomp_notify_fd.store(-1, std::memory_order_release);
     return;
   }
-  pthread_detach(th);
   if (g_verbose) {
-    LOG(INFO) << "scanner-syscall: filter active (" << prog.size() << " BPF insns)";
+    LOG(INFO) << "scanner-syscall: filter active (" << prog.size() << " BPF insns, " << spawned
+              << " supervisors)";
   }
 }

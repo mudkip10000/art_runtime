@@ -305,6 +305,13 @@ const Rule kRules[] = {
      ActionKind::kConstInt, false, 0, nullptr},
     {RASP, "Landroid/provider/Settings$Secure;", "getInt", false, 1, ARR(kSettingsAdbDevOptions),
      ActionKind::kConstInt, false, 0, nullptr},
+    // Same adb/dev-options keys read as a String and compared to "1": some hardened apps probe
+    // adb_enabled via getString, which the getInt hook above does not catch, so the "USB debugging on"
+    // block fires despite the int spoof. Force "0" (the on-device "off" value).
+    {RASP, "Landroid/provider/Settings$Global;", "getString", false, 1, ARR(kSettingsAdbDevOptions),
+     ActionKind::kConstString, false, 0, kFakeSettingOff},
+    {RASP, "Landroid/provider/Settings$Secure;", "getString", false, 1, ARR(kSettingsAdbDevOptions),
+     ActionKind::kConstString, false, 0, kFakeSettingOff},
 
     // android.security.keystore.*
     {RASP, "Landroid/security/keystore/KeyInfo;", "isInsideSecureHardware", false, kNoArg, nullptr,

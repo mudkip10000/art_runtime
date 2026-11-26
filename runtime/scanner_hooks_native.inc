@@ -2,7 +2,7 @@
  * scanner_hooks native interception layer.
  *
  * The managed rules in scanner_hooks_rules.inc only intercept framework (Java) calls. Hardened apps
- * (V-OS, Ant/Alipay, DexProtector) read the same anti-debug / anti-emulator signals in NATIVE code,
+ * read the same anti-debug / anti-emulator signals in NATIVE code,
  * straight through libc, bypassing the managed facades entirely. This layer intercepts those native
  * reads in the target process only, so the app sees clean values while the rest of the system (adbd,
  * the scanner's debugger) keeps seeing the real device.
@@ -109,6 +109,9 @@ const char* const kDenyPaths[] = {
 const char* const kMapsDropSubstrings[] = {
     "frida", "gum-js", "libgum", "xposed", "XposedBridge", "riru", "zygisk", "magisk",
     "/memfd:", "goldfish", "ranchu", "qemu",
+    // libjdwp.so is mapped only once a JDWP debugger attaches, so an app that scans its maps for it is
+    // doing anti-debug; drop it so the attached scanner debugger stays invisible.
+    "libjdwp.so",
 };
 
 bool PathInList(const char* path, const char* const* list, size_t n) {
@@ -270,7 +273,10 @@ bool SanitizeContent(const char* path, const std::string& real, std::string* out
     return true;
   }
   if (std::strcmp(path, "/proc/self/status") == 0) {
-    // Zero TracerPid so a ptrace/debugger check reads "not traced".
+    // Force TracerPid to 0 to hide a ptrace-based debugger/tracer. The Seccomp/Seccomp_filters fields
+    // are left untouched on purpose: a seccomp filter is normal on modern Android (every app runs under
+    // the zygote seccomp policy, and seccomp-based RASPs install their own), so "Seccomp: 2" is the
+    // expected value -- zeroing it would itself be the anomaly an anti-sandbox check looks for.
     *out = real;
     size_t pos = out->find("TracerPid:");
     if (pos != std::string::npos) {

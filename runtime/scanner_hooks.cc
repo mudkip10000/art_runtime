@@ -101,7 +101,9 @@ constexpr const char* kPropPackage = "dalvik.vm.scanner-package";
 constexpr const char* kPropSecureFlag = "dalvik.vm.scanner-secure-flag";
 constexpr const char* kPropDebugger = "dalvik.vm.scanner-debugger";
 constexpr const char* kPropVerbose = "dalvik.vm.scanner-verbose";
-constexpr const char* kPropNativeRasp = "dalvik.vm.scanner-native-rasp";  // one switch for the whole native-layer bypass (libc PLT/GOT hooks + seccomp /proc sanitizer + in-process property patch)
+constexpr const char* kPropNative = "dalvik.vm.scanner-native";        // libc PLT/GOT hook layer
+constexpr const char* kPropSyshook = "dalvik.vm.scanner-syshook";      // seccomp /proc sanitizer
+constexpr const char* kPropPropspoof = "dalvik.vm.scanner-propspoof";  // in-process property patch
 
 // ---------------------------------------------------------------------------
 // Rule table
@@ -242,10 +244,9 @@ bool g_cat_pkg = false;            // dalvik.vm.scanner-package
 bool g_cat_secure = false;         // dalvik.vm.scanner-secure-flag
 bool g_cat_debugger = false;       // dalvik.vm.scanner-debugger (deferred until a debugger attaches)
 bool g_verbose = false;            // dalvik.vm.scanner-verbose (log all scanner-hook activity; off by default)
-// The three below are all driven by the single dalvik.vm.scanner-native-rasp flag
-bool g_cat_native = false;         // native libc property/file PLT-GOT hook layer
-bool g_cat_syshook = false;        // seccomp spoofer; sanitize /proc, deny emulator/root paths
-bool g_cat_propspoof = false;      // COW-remap the inherited property-area mappings and patch emulator props in place at install
+bool g_cat_native = false;         // native libc property/file PLT-GOT hook layer (scanner-native)
+bool g_cat_syshook = false;        // seccomp spoofer; sanitize /proc, deny emulator/root paths (scanner-syshook)
+bool g_cat_propspoof = false;      // COW-remap the inherited property-area mappings and patch emulator props in place at install (scanner-propspoof)
 
 bool CategoryEnabled(RuleCategory c) {
   switch (c) {
@@ -1078,11 +1079,9 @@ void ScannerHooks::Install() {
   g_cat_secure = android::base::GetBoolProperty(kPropSecureFlag, false);
   g_cat_debugger = android::base::GetBoolProperty(kPropDebugger, false);
   g_verbose = android::base::GetBoolProperty(kPropVerbose, false);
-  // The three native-layer mechanisms share one flag: they are complementary (libc-routed, raw-syscall /proc, and mmap'd properties) and always deployed together
-  bool native_rasp = android::base::GetBoolProperty(kPropNativeRasp, false);
-  g_cat_native = native_rasp;
-  g_cat_syshook = native_rasp;
-  g_cat_propspoof = native_rasp;
+  g_cat_native = android::base::GetBoolProperty(kPropNative, false);
+  g_cat_syshook = android::base::GetBoolProperty(kPropSyshook, false);
+  g_cat_propspoof = android::base::GetBoolProperty(kPropPropspoof, false);
   // Device API level, used by the Google-package spoof rules to pick version-specific object shapes.
   g_sdk_int = android::base::GetIntProperty("ro.build.version.sdk", 0);
   if (g_target_package.empty() || !AnyCategoryEnabled()) {
