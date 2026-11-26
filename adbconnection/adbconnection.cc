@@ -30,6 +30,7 @@
 
 #include "adbconnection/client.h"
 #include "android-base/endian.h"
+#include "android-base/properties.h"
 #include "android-base/stringprintf.h"
 #include "android-base/unique_fd.h"
 #include "art_field-inl.h"
@@ -280,11 +281,20 @@ AdbConnectionState::~AdbConnectionState() {
   }
 }
 
+// RASP bypass: with the scanner's debugger category active, this thread's name would let a native
+// anti-debug check that scans /proc/self/task/<tid>/comm (or the Java thread list) spot the attached
+// JDWP debugger. The name is purely cosmetic, so serve a benign one while hiding; the flag is read once.
+static const char* AdbConnectionThreadName() {
+  static const bool kHideDebugger =
+      android::base::GetBoolProperty("dalvik.vm.scanner-debugger", false);
+  return kHideDebugger ? "Runtime worker" : kAdbConnectionThreadName;
+}
+
 static art::ObjPtr<art::mirror::Object> CreateAdbConnectionThread(art::Thread* self)
     REQUIRES_SHARED(art::Locks::mutator_lock_) {
   art::StackHandleScope<3u> hs(self);
   art::Handle<art::mirror::String> thr_name =
-      hs.NewHandle(art::mirror::String::AllocFromModifiedUtf8(self, kAdbConnectionThreadName));
+      hs.NewHandle(art::mirror::String::AllocFromModifiedUtf8(self, AdbConnectionThreadName()));
   if (thr_name == nullptr) {
     DCHECK(self->IsExceptionPending());
     return nullptr;
@@ -310,13 +320,13 @@ struct CallbackData {
 
 static void* CallbackFunction(void* vdata) {
   std::unique_ptr<CallbackData> data(reinterpret_cast<CallbackData*>(vdata));
-  art::Thread* self = art::Thread::Attach(kAdbConnectionThreadName, true, data->thr_);
+  art::Thread* self = art::Thread::Attach(AdbConnectionThreadName(), true, data->thr_);
   CHECK(self != nullptr) << "threads_being_born_ should have ensured thread could be attached.";
   // The name in Attach() is only for logging. Set the thread name. This is important so
   // that the thread is no longer seen as starting up.
   {
     art::ScopedObjectAccess soa(self);
-    self->SetThreadName(kAdbConnectionThreadName);
+    self->SetThreadName(AdbConnectionThreadName());
   }
 
   // Release the peer.
